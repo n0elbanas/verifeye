@@ -1,0 +1,5 @@
+{
+  "name": "VerifEye Email Validator",
+  "description": "A professional-grade email verification tool that checks syntax, MX records, and deliverability for both personal and business domains.",
+  "requestFramePermissions": []
+}
