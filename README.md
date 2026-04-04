@@ -73,3 +73,18 @@ pm2 start "npm start" --name verifeye
 pm2 save
 pm2 startup
 ```
+
+### Option B: Reverse Proxy with Caddy (Recommended for Auto-SSL)
+
+If you are using Caddy, it will automatically handle HTTPS (SSL certificates) for you. Add this to your `/etc/caddy/Caddyfile`:
+
+```caddy
+verifeye.grenoma.cloud {
+    reverse_proxy localhost:3000
+}
+```
+
+Then simply reload Caddy:
+```bash
+systemctl reload caddy
+```
