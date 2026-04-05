@@ -26,19 +26,19 @@ export default function Layout() {
           
           {user && (
             <div className="flex items-center gap-4">
-              <div className="text-xs text-zinc-500 hidden sm:flex items-center gap-3">
+              <div className="hidden sm:block text-xs text-zinc-500">
                 <span>
                   {user.email} <span className="uppercase text-[9px] bg-zinc-100 px-1.5 py-0.5 rounded font-mono ml-1">{user.role}</span>
                 </span>
-                <div className="flex items-center gap-1.5 bg-emerald-50 text-emerald-700 border border-emerald-100 px-2.5 py-1 rounded-full font-mono text-[10px]" title="Daily Verification Limit">
-                  <span className="font-medium">
-                    {user.emails_checked_today ?? 0}
-                  </span>
-                  <span className="opacity-50">/</span>
-                  <span className="font-medium">
-                    {user.daily_limit === -1 ? '∞' : user.daily_limit}
-                  </span>
-                </div>
+              </div>
+              <div className="flex items-center gap-1 bg-emerald-50 text-emerald-700 border border-emerald-100 px-2 sm:px-2.5 py-1 rounded-full font-mono text-[10px]" title="Daily Verification Limit">
+                <span className="font-medium">
+                  {user.emails_checked_today ?? 0}
+                </span>
+                <span className="opacity-50">/</span>
+                <span className="font-medium">
+                  {user.daily_limit === -1 ? '∞' : user.daily_limit}
+                </span>
               </div>
               <Link to="/logs" className="p-2 text-zinc-400 hover:text-emerald-600 transition-colors" title="Audit Logs">
                 <FileText className="w-5 h-5" />
