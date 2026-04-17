@@ -53,7 +53,7 @@ interface EmailVerificationResult {
   logId?: number;
 }
 
-type DeepVerifyStatus = "idle" | "loading" | "sent" | "delivered" | "bounced" | "failed" | "pending" | "sending" | "disabled";
+type DeepVerifyStatus = "idle" | "loading" | "sent" | "delivered" | "bounced" | "failed" | "pending" | "sending" | "disabled" | "timeout";
 
 interface DeepVerifyState {
   status: DeepVerifyStatus;
@@ -230,9 +230,15 @@ function DeepVerifyPanel({
     message: "",
   });
 
-  const poll = useCallback(async (queueId: number) => {
+  const poll = useCallback(async (queueId: number, attempt = 0) => {
     try {
       const { data } = await axios.get(`/api/verify/deep/${queueId}`);
+
+      if (data.status === "sent" && attempt > 12) {
+        setState((prev) => ({ ...prev, status: "timeout", message: "Timeout: No open detected" }));
+        return;
+      }
+
       setState((prev) => ({
         ...prev,
         status: data.status as DeepVerifyStatus,
@@ -240,7 +246,7 @@ function DeepVerifyPanel({
       }));
       // Keep polling if still in-progress
       if (["pending", "sending", "sent"].includes(data.status)) {
-        setTimeout(() => poll(queueId), 5000);
+        setTimeout(() => poll(queueId, attempt + 1), 5000);
       }
     } catch {
       setState((prev) => ({ ...prev, status: "failed", message: "Failed to check status" }));
@@ -276,16 +282,18 @@ function DeepVerifyPanel({
     bounced:   <XCircle className="w-4 h-4 text-red-500" />,
     failed:    <AlertCircle className="w-4 h-4 text-red-400" />,
     disabled:  <AlertCircle className="w-4 h-4 text-zinc-400" />,
+    timeout:   <AlertCircle className="w-4 h-4 text-amber-500" />,
   };
 
   const statusLabels: Partial<Record<DeepVerifyStatus, string>> = {
     pending:  "Email sent — awaiting open/delivery...",
     sending:  "Sending probe email...",
-    sent:     "Email delivered to server — awaiting open tracking...",
+    sent:     "Delivered to provider. Awaiting open...",
     delivered:"✓ Email opened — address is active!",
     bounced:  `Bounced — ${state.message || "address likely invalid"}`,
     failed:   state.message || "Deep verification failed",
     disabled: "Deep verification requires SMTP credentials in .env",
+    timeout:  "Delivered but unopened. Likely inactive or invalid.",
   };
 
   return (
