@@ -106,7 +106,7 @@ export async function sendDeepVerification(
   }
 
   const { id, token } = await createDeepVerificationRequest(logId, email);
-  const pixelUrl = `${APP_URL}/api/tracking/pixel/${token}`;
+  const pixelUrl = `${APP_URL}/r/${token}`;
   const db = await getDb();
 
   // Send asynchronously — don't block the API response

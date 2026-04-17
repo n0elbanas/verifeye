@@ -942,6 +942,39 @@ app.get("/api/logs", requireAuth, async (req: AuthRequest, res) => {
 });
 
 // ── Verification ──────────────────────────────────────────────────────────────
+
+/**
+ * Insert a verification log row. Falls back to the base 3-column insert if the
+ * confidence_score / flags columns are missing (un-migrated production databases).
+ * db.ts self-heals those columns on startup, so this fallback only fires on the
+ * very first request before the process has restarted post-deploy.
+ */
+async function safeLogInsert(
+  db: any,
+  userId: number,
+  email: string,
+  status: string,
+  confidenceScore: number,
+  flags: string[]
+): Promise<{ lastID: number | undefined }> {
+  try {
+    return await db.run(
+      "INSERT INTO logs (user_id, email, status, confidence_score, flags) VALUES (?, ?, ?, ?, ?)",
+      [userId, email, status, confidenceScore, JSON.stringify(flags)]
+    );
+  } catch (err: any) {
+    // Column missing — production DB not yet migrated; degrade gracefully
+    if (err?.message?.includes("no column") || err?.message?.includes("has no column")) {
+      console.warn("[VerifEye] logs table missing new columns — falling back to base insert. Restart the server to apply the self-healing migration.");
+      return db.run(
+        "INSERT INTO logs (user_id, email, status) VALUES (?, ?, ?)",
+        [userId, email, status]
+      );
+    }
+    throw err;
+  }
+}
+
 app.post("/api/verify", rateLimit, requireAuth, async (req: AuthRequest, res: Response) => {
   try {
     const { email } = req.body;
@@ -953,21 +986,18 @@ app.post("/api/verify", rateLimit, requireAuth, async (req: AuthRequest, res: Re
 
     const result = await verifySingleEmail(email.trim());
 
-    // Save with enriched data
-    const logResult = await db.run(
-      "INSERT INTO logs (user_id, email, status, confidence_score, flags) VALUES (?, ?, ?, ?, ?)",
-      [req.user.id, result.email, result.status, result.confidenceScore, JSON.stringify(result.flags)]
+    const logResult = await safeLogInsert(
+      db, req.user.id, result.email, result.status, result.confidenceScore, result.flags
     );
 
-    // Enqueue greylisted emails for automatic retry
     if (result.details.smtpVerdict === "greylisted") {
       await enqueueRetry(result.email, req.user.id);
     }
 
     return res.json({ ...result, logId: logResult.lastID });
   } catch (error: any) {
-    console.error("[VerifEye] /api/verify error:", error);
-    return res.status(500).json({ error: "Internal server error" });
+    console.error("[VerifEye] /api/verify error:", error?.message ?? error);
+    return res.status(500).json({ error: "Internal server error", detail: error?.message });
   }
 });
 
@@ -985,19 +1015,17 @@ app.post("/api/verify-bulk", rateLimit, requireAuth, async (req: AuthRequest, re
 
     const results = await verifyBatch(trimmed);
 
-    const stmt = await db.prepare("INSERT INTO logs (user_id, email, status, confidence_score, flags) VALUES (?, ?, ?, ?, ?)");
     for (const r of results) {
-      await stmt.run([req.user.id, r.email, r.status, r.confidenceScore, JSON.stringify(r.flags)]);
+      await safeLogInsert(db, req.user.id, r.email, r.status, r.confidenceScore, r.flags);
       if (r.details.smtpVerdict === "greylisted") {
         await enqueueRetry(r.email, req.user.id);
       }
     }
-    await stmt.finalize();
 
     return res.json({ results, total: results.length });
   } catch (error: any) {
-    console.error("[VerifEye] /api/verify-bulk error:", error);
-    return res.status(500).json({ error: "Internal server error during bulk processing" });
+    console.error("[VerifEye] /api/verify-bulk error:", error?.message ?? error);
+    return res.status(500).json({ error: "Internal server error during bulk processing", detail: error?.message });
   }
 });
 
@@ -1032,13 +1060,15 @@ app.get("/api/verify/deep/:id", requireAuth, async (req: AuthRequest, res: Respo
   }
 });
 
-// ── Tracking pixel ────────────────────────────────────────────────────────────
+// ── Open-tracking pixel ───────────────────────────────────────────────────────
+// Route intentionally uses a neutral path (/r/:token) — paths containing
+// "tracking" or "pixel" are blocked by every major ad blocker (uBlock, Brave, etc.).
 const PIXEL_GIF = Buffer.from(
   "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7",
   "base64"
 );
 
-app.get("/api/tracking/pixel/:token", async (req, res) => {
+app.get("/r/:token", async (req, res) => {
   try {
     await markPixelDelivered(req.params.token);
   } catch (_) {}

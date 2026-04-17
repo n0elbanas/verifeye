@@ -4,6 +4,24 @@ import bcrypt from "bcryptjs";
 
 let dbInstance: Database | null = null;
 
+/**
+ * Add a column to a table only if it doesn't already exist.
+ * SQLite has no "ALTER TABLE ADD COLUMN IF NOT EXISTS" — we use PRAGMA table_info instead.
+ */
+async function addColumnIfMissing(
+  db: Database,
+  table: string,
+  column: string,
+  definition: string
+): Promise<void> {
+  const info = await db.all(`PRAGMA table_info(${table})`);
+  const exists = info.some((col: any) => col.name === column);
+  if (!exists) {
+    await db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+    console.log(`[VerifEye DB] Added column: ${table}.${column}`);
+  }
+}
+
 export async function getDb(): Promise<Database> {
   if (dbInstance) {
     return dbInstance;
@@ -14,6 +32,10 @@ export async function getDb(): Promise<Database> {
     driver: sqlite3.Database,
   });
 
+  // Enable WAL mode for better concurrent read/write performance
+  await db.exec("PRAGMA journal_mode=WAL;");
+
+  // ── Core tables ──────────────────────────────────────────────────────────
   await db.exec(`
     CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -30,13 +52,10 @@ export async function getDb(): Promise<Database> {
       user_id INTEGER NOT NULL,
       email TEXT NOT NULL,
       status TEXT NOT NULL,
-      confidence_score INTEGER,
-      flags TEXT,
       timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (user_id) REFERENCES users (id)
     );
 
-    -- Deep (real-email) verification queue
     CREATE TABLE IF NOT EXISTS verification_queue (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       log_id INTEGER REFERENCES logs(id),
@@ -50,7 +69,6 @@ export async function getDb(): Promise<Database> {
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
 
-    -- SMTP greylisting retry queue
     CREATE TABLE IF NOT EXISTS retry_queue (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       email TEXT NOT NULL,
@@ -64,8 +82,14 @@ export async function getDb(): Promise<Database> {
     );
   `);
 
-  // Ensure default admin exists
-  const admin = await db.get("SELECT * FROM users WHERE email = 'admin@verifeye.ph'");
+  // ── Self-healing migrations ──────────────────────────────────────────────
+  // These run on EVERY startup and safely add any missing columns.
+  // This means the production server never needs a manual migration run.
+  await addColumnIfMissing(db, "logs", "confidence_score", "INTEGER DEFAULT NULL");
+  await addColumnIfMissing(db, "logs", "flags", "TEXT DEFAULT NULL");
+
+  // ── Default admin ────────────────────────────────────────────────────────
+  const admin = await db.get("SELECT id FROM users WHERE email = 'admin@verifeye.ph'");
   if (!admin) {
     const defaultPasswordHash = await bcrypt.hash("asdQWE123#", 10);
     await db.run(
