@@ -310,12 +310,12 @@ interface ScoreFactors {
 function calculateConfidenceScore(factors: ScoreFactors): number {
   let score = 0;
 
-  // Positive signals
-  if (factors.syntaxValid) score += 25;
-  if (factors.mxFound) score += 25;
-  if (factors.smtpAccepted && !factors.smtpBlocking) score += 20;
-  if (factors.businessDomain) score += 5;
-  if (factors.educationalDomain) score += 3;
+  // Positive signals (base 90 for a perfectly verified free email)
+  if (factors.syntaxValid) score += 30;
+  if (factors.mxFound) score += 30;
+  if (factors.smtpAccepted) score += 30;
+  if (factors.businessDomain) score += 10;
+  if (factors.educationalDomain) score += 5;
 
   // Negative signals
   if (factors.disposable) score -= 25;
@@ -445,7 +445,7 @@ function smtpProbe(
         } else if (step === 1) {
           if (code === 250) {
             await jitter();
-            socket.write(`MAIL FROM:<probe@verifeye.io>\r\n`);
+            socket.write(`MAIL FROM:<>\r\n`);
             step = 2;
           } else {
             done({ verdict: "policy_block", message: `EHLO rejected (${code})`, catchAll: false });
@@ -641,44 +641,10 @@ async function verifySingleEmail(email: string): Promise<EmailVerificationResult
   const isFreeProvider = base.providerType === "free";
   if (isFreeProvider) base.flags.push("free_provider");
 
-  const isSmtpBlocking = SMTP_BLOCKING_PROVIDERS.has(mxProvider ?? "");
   const isEducational = isEducationalDomain(domain);
   const isBusinessDomain = base.providerType === "business";
 
-  // ─── Layer 4: Provider short-circuit (Yahoo/Gmail/MS etc.) ──────────────
-  // These providers block or lie during SMTP probing — never probe them.
-  // Use heuristic scoring instead.
-  if (isSmtpBlocking) {
-    base.details.smtpSkipped = true;
-    base.details.smtpVerdict = "skipped_blocking_provider";
-
-    const score = calculateConfidenceScore({
-      syntaxValid: true, mxFound: true,
-      smtpAccepted: false, catchAll: false,
-      roleBased: isRoleBased, disposable: false, freeProvider: true,
-      educationalDomain: false, businessDomain: false,
-      typoDomain: !!typoSuggestion, smtpBlocking: true,
-      greylisted: false, policyBlock: false,
-    });
-
-    base.confidenceScore = score;
-    base.status = scoreToStatus(score);
-
-    const providerName = mxProvider
-      ? ({ google: "Gmail/Google Workspace", yahoo: "Yahoo Mail", microsoft: "Outlook/Hotmail/Microsoft 365", icloud: "iCloud Mail", protonmail: "ProtonMail" }[mxProvider] ?? mxProvider)
-      : domain;
-
-    base.reason = [
-      `${providerName} blocks all external SMTP verification — this is their anti-spam policy, not a rejection of this address.`,
-      `Syntax and MX records are valid. Confidence: ${score}/100.`,
-      isRoleBased ? `Role-based address (${prefix}@) — may not reach a personal inbox.` : "",
-      typoSuggestion ? `Possible typo detected — did you mean "${typoSuggestion}"?` : "",
-    ].filter(Boolean).join(" ");
-
-    return base;
-  }
-
-  // ─── Layer 5: SMTP probe (business/non-blocking domains only) ───────────
+  // ─── Layer 5: SMTP probe (all domains) ───────────
   const primaryMx = [...mxRecords].sort((a, b) => a.priority - b.priority)[0].exchange;
   let smtp: SmtpResult = { verdict: "error", message: "Rate-limited", catchAll: false };
 
