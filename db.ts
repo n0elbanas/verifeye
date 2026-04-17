@@ -30,12 +30,41 @@ export async function getDb(): Promise<Database> {
       user_id INTEGER NOT NULL,
       email TEXT NOT NULL,
       status TEXT NOT NULL,
+      confidence_score INTEGER,
+      flags TEXT,
       timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (user_id) REFERENCES users (id)
     );
+
+    -- Deep (real-email) verification queue
+    CREATE TABLE IF NOT EXISTS verification_queue (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      log_id INTEGER REFERENCES logs(id),
+      email TEXT NOT NULL,
+      tracking_token TEXT UNIQUE,
+      status TEXT NOT NULL DEFAULT 'pending',
+      send_attempt INTEGER NOT NULL DEFAULT 0,
+      last_attempt_at DATETIME,
+      resolved_at DATETIME,
+      bounce_code TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- SMTP greylisting retry queue
+    CREATE TABLE IF NOT EXISTS retry_queue (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      email TEXT NOT NULL,
+      user_id INTEGER REFERENCES users(id),
+      attempts INTEGER NOT NULL DEFAULT 0,
+      next_retry_at DATETIME NOT NULL,
+      last_result TEXT,
+      resolved INTEGER NOT NULL DEFAULT 0,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(email, user_id)
+    );
   `);
 
-  // Check if admin exists
+  // Ensure default admin exists
   const admin = await db.get("SELECT * FROM users WHERE email = 'admin@verifeye.ph'");
   if (!admin) {
     const defaultPasswordHash = await bcrypt.hash("asdQWE123#", 10);

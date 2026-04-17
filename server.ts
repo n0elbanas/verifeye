@@ -8,6 +8,13 @@ import cookieParser from "cookie-parser";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
 import { getDb } from "./db.js";
+import { startRetryQueue, enqueueRetry, getPendingJobs, registerSmtpProbe } from "./src/queue/retryQueue.js";
+import {
+  MAILER_ENABLED,
+  sendDeepVerification,
+  getDeepVerificationStatus,
+  markPixelDelivered,
+} from "./src/mailer/verificationMailer.js";
 
 const JWT_SECRET = process.env.JWT_SECRET || "supersecret_verifeye123!";
 
@@ -15,7 +22,7 @@ const resolveMx = promisify(dns.resolveMx);
 const resolveA = promisify(dns.resolve4);
 
 const app = express();
-const PORT = 3000;
+const PORT = parseInt(process.env.PORT ?? "3000");
 const MAX_BULK = 1000;
 const BATCH_SIZE = 20;
 
@@ -24,7 +31,9 @@ app.use(cookieParser());
 
 getDb().catch(console.error);
 
-// Auth Middleware
+// ---------------------------------------------------------------------------
+// Auth middleware
+// ---------------------------------------------------------------------------
 interface AuthRequest extends Request {
   user?: any;
 }
@@ -36,7 +45,7 @@ const requireAuth = (req: AuthRequest, res: Response, next: NextFunction) => {
     const decoded = jwt.verify(token, JWT_SECRET);
     req.user = decoded;
     next();
-  } catch (err) {
+  } catch {
     return res.status(401).json({ error: "Invalid token" });
   }
 };
@@ -46,37 +55,36 @@ const requireAdmin = (req: AuthRequest, res: Response, next: NextFunction) => {
   next();
 };
 
+// ---------------------------------------------------------------------------
+// Daily-limit helper
+// ---------------------------------------------------------------------------
 async function checkAndLogLimit(db: any, userId: number, count: number): Promise<boolean> {
   const user = await db.get("SELECT * FROM users WHERE id = ?", [userId]);
   if (!user) return false;
 
-  const today = new Date().toISOString().split("T")[0]; // YYYY-MM-DD
-  
+  const today = new Date().toISOString().split("T")[0];
   if (user.last_check_date !== today) {
-    // Reset limit for new day
     await db.run("UPDATE users SET emails_checked_today = 0, last_check_date = ? WHERE id = ?", [today, userId]);
     user.emails_checked_today = 0;
   }
 
   if (user.daily_limit !== -1 && (user.emails_checked_today + count) > user.daily_limit) {
-    return false; // Limit exceeded
+    return false;
   }
-  
-  // Update limit
+
   await db.run("UPDATE users SET emails_checked_today = emails_checked_today + ? WHERE id = ?", [count, userId]);
   return true;
 }
 
-
 // ---------------------------------------------------------------------------
-// Rate limiting (100 req / min per IP, shared across all /api routes)
+// Rate limiting (100 req / min per IP)
 // ---------------------------------------------------------------------------
 const rateLimitMap = new Map<string, { count: number; resetAt: number }>();
 
 function rateLimit(req: Request, res: Response, next: () => void) {
   const ip = (req.headers["x-forwarded-for"] as string) || req.socket.remoteAddress || "unknown";
   const now = Date.now();
-  const window = 60_000; // 1 minute
+  const window = 60_000;
   const limit = 100;
 
   let entry = rateLimitMap.get(ip);
@@ -84,7 +92,6 @@ function rateLimit(req: Request, res: Response, next: () => void) {
     entry = { count: 0, resetAt: now + window };
     rateLimitMap.set(ip, entry);
   }
-
   entry.count++;
   if (entry.count > limit) {
     res.status(429).json({ error: "Too many requests. Please wait a minute." });
@@ -94,7 +101,46 @@ function rateLimit(req: Request, res: Response, next: () => void) {
 }
 
 // ---------------------------------------------------------------------------
-// Disposable email provider domains
+// Per-domain SMTP rate limiter (max 5 probes / domain / min)
+// Prevents getting blacklisted from hammering specific mail servers.
+// ---------------------------------------------------------------------------
+const smtpDomainMap = new Map<string, { count: number; resetAt: number }>();
+
+function canSmtpProbe(domain: string): boolean {
+  const now = Date.now();
+  const window = 60_000;
+  const limit = 5;
+
+  let entry = smtpDomainMap.get(domain);
+  if (!entry || now > entry.resetAt) {
+    entry = { count: 0, resetAt: now + window };
+    smtpDomainMap.set(domain, entry);
+  }
+  entry.count++;
+  return entry.count <= limit;
+}
+
+// ---------------------------------------------------------------------------
+// MX record cache (5-minute TTL)
+// ---------------------------------------------------------------------------
+interface MxCacheEntry {
+  records: dns.MxRecord[];
+  expiresAt: number;
+}
+const mxCache = new Map<string, MxCacheEntry>();
+
+async function resolveMxCached(domain: string): Promise<dns.MxRecord[]> {
+  const now = Date.now();
+  const cached = mxCache.get(domain);
+  if (cached && now < cached.expiresAt) return cached.records;
+
+  const records = await resolveMx(domain);
+  mxCache.set(domain, { records, expiresAt: now + 5 * 60 * 1000 });
+  return records;
+}
+
+// ---------------------------------------------------------------------------
+// Disposable email domains
 // ---------------------------------------------------------------------------
 const DISPOSABLE_DOMAINS = new Set([
   "mailinator.com", "guerrillamail.com", "guerrillamail.net", "guerrillamail.org",
@@ -113,9 +159,11 @@ const DISPOSABLE_DOMAINS = new Set([
   "mailismagic.com", "objectmail.com", "obobbo.com",
   "discardmail.com", "discardmail.de", "spamgob.com",
   "tempr.email", "trbvm.com", "filzmail.com",
-  "0815.ru", "0815.ry", "spamtrap.ro",
-  "sharklasers.com", "guerrillamailblock.com", "spam4.me",
-  "boun.cr", "cfl.fr", "deadlymemes.com",
+  "0815.ru", "0815.ry", "spamtrap.ro", "spam4.me",
+  "boun.cr", "cfl.fr", "deadlymemes.com", "10minutemail.com",
+  "10minutemail.net", "mytemp.email", "fakemailgenerator.com",
+  "mailnesia.com", "dispostable.com", "mailexpire.com",
+  "spamfree24.org", "spam.la", "nowhere.org",
 ]);
 
 // ---------------------------------------------------------------------------
@@ -129,16 +177,18 @@ const ROLE_PREFIXES = new Set([
   "sales", "marketing", "billing", "accounts",
   "hr", "jobs", "careers", "office",
   "privacy", "legal", "security", "team",
-  "hello", "enquiries", "enquiry",
+  "hello", "enquiries", "enquiry", "newsletter",
+  "news", "notifications", "mailer", "bounce",
+  "root", "daemon", "nobody", "www",
 ]);
 
 // ---------------------------------------------------------------------------
-// Free mail provider domain names (used as first-pass check)
+// Free-provider domains list
 // ---------------------------------------------------------------------------
 const FREE_PROVIDER_DOMAINS = new Set([
   "gmail.com", "googlemail.com",
   "yahoo.com", "yahoo.co.uk", "yahoo.fr", "yahoo.de", "yahoo.es", "yahoo.in",
-  "yahoo.com.au", "yahoo.com.br", "yahoo.com.ar",
+  "yahoo.com.au", "yahoo.com.br", "yahoo.com.ar", "yahoo.co.jp",
   "hotmail.com", "hotmail.co.uk", "hotmail.fr", "hotmail.de", "hotmail.es",
   "outlook.com", "live.com", "msn.com", "live.co.uk", "live.fr",
   "aol.com", "icloud.com", "me.com", "mac.com",
@@ -147,83 +197,162 @@ const FREE_PROVIDER_DOMAINS = new Set([
 ]);
 
 // ---------------------------------------------------------------------------
-// MX-based provider fingerprinting (Verifalia-style — catches any custom
-// domain hosted on Microsoft/Google/Yahoo infrastructure)
+// Typo domain detection — Levenshtein distance on curated list
+// ---------------------------------------------------------------------------
+const KNOWN_GOOD_DOMAINS = [
+  "gmail.com", "googlemail.com", "yahoo.com", "yahoo.co.uk", "yahoo.fr",
+  "hotmail.com", "outlook.com", "live.com", "msn.com", "aol.com",
+  "icloud.com", "me.com", "protonmail.com", "proton.me",
+  "zoho.com", "mail.com", "gmx.com", "gmx.net",
+  "yandex.com", "yandex.ru", "fastmail.com", "fastmail.fm",
+];
+
+function levenshtein(a: string, b: string): number {
+  const m = a.length, n = b.length;
+  const dp: number[][] = Array.from({ length: m + 1 }, (_, i) =>
+    Array.from({ length: n + 1 }, (_, j) => (i === 0 ? j : j === 0 ? i : 0))
+  );
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      dp[i][j] = a[i - 1] === b[j - 1]
+        ? dp[i - 1][j - 1]
+        : 1 + Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]);
+    }
+  }
+  return dp[m][n];
+}
+
+function detectTypoDomain(domain: string): string | null {
+  // Skip if it's already a known-good domain
+  if (KNOWN_GOOD_DOMAINS.includes(domain)) return null;
+
+  let bestMatch: string | null = null;
+  let bestScore = Infinity;
+
+  for (const known of KNOWN_GOOD_DOMAINS) {
+    const dist = levenshtein(domain, known);
+    // Only flag if 1–2 character difference (e.g., gmail.con → gmail.com)
+    if (dist <= 2 && dist < bestScore) {
+      bestScore = dist;
+      bestMatch = known;
+    }
+  }
+
+  return bestMatch;
+}
+
+// ---------------------------------------------------------------------------
+// MX fingerprinting — detect provider from MX exchange hostnames
 // ---------------------------------------------------------------------------
 function detectProviderFromMx(mxExchanges: string[]): string | null {
   for (const mx of mxExchanges) {
     const m = mx.toLowerCase();
-    // Microsoft (Outlook/Hotmail/Live + Office 365 custom domains)
     if (m.includes(".outlook.com") || m.includes(".protection.outlook.com") ||
-        m.includes(".hotmail.com") || m.includes(".live.com")) {
-      return "microsoft";
-    }
-    // Google (Gmail + Google Workspace custom domains)
+        m.includes(".hotmail.com") || m.includes(".live.com")) return "microsoft";
     if (m.includes(".google.com") || m.includes(".googlemail.com") ||
-        m === "gmail-smtp-in.l.google.com" || m.includes(".smtp.goog")) {
-      return "google";
-    }
-    // Yahoo
-    if (m.includes(".yahoodns.net") || m.includes(".yahoo.com")) {
-      return "yahoo";
-    }
-    // iCloud / Apple
-    if (m.includes(".icloud.com") || m.includes(".apple.com")) {
-      return "icloud";
-    }
-    // ProtonMail
-    if (m.includes(".protonmail.ch") || m.includes(".proton.me")) {
-      return "protonmail";
-    }
-    // Zoho
-    if (m.includes(".zoho.com") || m.includes(".zoho.eu")) {
-      return "zoho";
-    }
+        m === "gmail-smtp-in.l.google.com" || m.includes(".smtp.goog")) return "google";
+    if (m.includes(".yahoodns.net") || m.includes(".yahoo.com")) return "yahoo";
+    if (m.includes(".icloud.com") || m.includes(".apple.com")) return "icloud";
+    if (m.includes(".protonmail.ch") || m.includes(".proton.me")) return "protonmail";
+    if (m.includes(".zoho.com") || m.includes(".zoho.eu")) return "zoho";
   }
   return null;
 }
 
-// ---------------------------------------------------------------------------
-// Educational TLD detection
-// ---------------------------------------------------------------------------
+/**
+ * Providers that block or lie during SMTP probing.
+ * These are NEVER probed — heuristic scoring only.
+ *
+ * Why:
+ *  - Yahoo:     Accepts ALL RCPT TO with 250 OK (anti-enumeration), then discards silently → false positives
+ *  - Gmail:     Rejects ALL RCPT TO with 550 5.1.1 from unknown IPs → false negatives
+ *  - Microsoft: Returns 550 5.7.x for most probes → policy block, not address invalid
+ *  - iCloud:    Drops connections at firewall level
+ *  - ProtonMail:Blocks all external SMTP probes (privacy policy)
+ */
+const SMTP_BLOCKING_PROVIDERS = new Set(["google", "yahoo", "microsoft", "icloud", "protonmail"]);
+
 function isEducationalDomain(domain: string): boolean {
   const d = domain.toLowerCase();
-  if (d.endsWith(".edu")) return true;
-  if (/\.edu\.[a-z]{2}$/.test(d)) return true;
-  if (/\.ac\.[a-z]{2,}$/.test(d)) return true;
-  return false;
+  return d.endsWith(".edu") || /\.edu\.[a-z]{2}$/.test(d) || /\.ac\.[a-z]{2,}$/.test(d);
 }
 
-// Known free provider MX fingerprints that always block SMTP verification
-const SMTP_BLOCKING_PROVIDERS = new Set(["google", "microsoft", "yahoo", "icloud", "protonmail"]);
-
-// ---------------------------------------------------------------------------
-// Classify domain type (domain name + MX fingerprint)
-// ---------------------------------------------------------------------------
 function classifyProvider(domain: string, mxExchanges: string[] = []): string {
   const d = domain.toLowerCase();
   if (DISPOSABLE_DOMAINS.has(d)) return "disposable";
   if (FREE_PROVIDER_DOMAINS.has(d)) return "free";
-  // Check MX fingerprint for custom domains hosted on free provider infra
   const mxProvider = detectProviderFromMx(mxExchanges);
-  if (mxProvider) return "free"; // hosted on free/major provider infra
+  if (mxProvider) return "free";
   if (isEducationalDomain(d)) return "educational";
   return "business";
 }
 
 // ---------------------------------------------------------------------------
-// Verifalia-style SMTP response code interpretation
+// Confidence Scoring Engine
+// ---------------------------------------------------------------------------
+interface ScoreFactors {
+  syntaxValid: boolean;
+  mxFound: boolean;
+  smtpAccepted: boolean;
+  catchAll: boolean;
+  roleBased: boolean;
+  disposable: boolean;
+  freeProvider: boolean;
+  educationalDomain: boolean;
+  businessDomain: boolean;
+  typoDomain: boolean;
+  smtpBlocking: boolean;
+  greylisted: boolean;
+  policyBlock: boolean;
+}
+
+function calculateConfidenceScore(factors: ScoreFactors): number {
+  let score = 0;
+
+  // Positive signals
+  if (factors.syntaxValid) score += 25;
+  if (factors.mxFound) score += 25;
+  if (factors.smtpAccepted && !factors.smtpBlocking) score += 20;
+  if (factors.businessDomain) score += 5;
+  if (factors.educationalDomain) score += 3;
+
+  // Negative signals
+  if (factors.disposable) score -= 25;
+  if (factors.catchAll) score -= 15;
+  if (factors.roleBased) score -= 10;
+  if (factors.freeProvider) score -= 5;
+  if (factors.typoDomain) score -= 20;
+  if (factors.policyBlock) score -= 5; // slight penalty, but not decisive
+  if (factors.greylisted) score -= 5;  // slight — usually means valid, retry pending
+
+  // Hard caps for blocking providers:
+  // Never exceed 72 for blocking providers (we cannot confirm the mailbox)
+  if (factors.smtpBlocking && score > 72) score = 72;
+
+  return Math.max(0, Math.min(100, score));
+}
+
+function scoreToStatus(score: number): EmailStatus {
+  if (score >= 80) return "Valid";
+  if (score >= 50) return "Risky";
+  if (score >= 1)  return "Unknown";
+  return "Invalid";
+}
+
+// ---------------------------------------------------------------------------
+// SMTP verdict types
 // ---------------------------------------------------------------------------
 type SmtpVerdict =
-  | "accepted"          // 250 — mailbox confirmed
-  | "invalid_mailbox"   // 5.1.1 / 5.1.2 — user does not exist
-  | "policy_block"      // 5.7.x — server blocked the probe (does NOT mean invalid)
-  | "rejected_other"    // other 5xx
-  | "greylisted"        // 4xx — temporary deferral, retry later
-  | "catch_all"         // accepted + catch-all probe also accepted
-  | "blocked"           // network-level: port blocked / connection refused
-  | "timeout"           // socket timeout
-  | "error";            // unexpected error
+  | "accepted"
+  | "invalid_mailbox"
+  | "policy_block"
+  | "rejected_other"
+  | "greylisted"
+  | "catch_all"
+  | "blocked"
+  | "timeout"
+  | "error"
+  | "skipped"; // NEW — for blocking providers
 
 interface SmtpResult {
   verdict: SmtpVerdict;
@@ -231,52 +360,54 @@ interface SmtpResult {
   catchAll: boolean;
 }
 
-/**
- * Parse an SMTP response line into a SmtpVerdict.
- * Enhanced detail codes (5.1.1, 5.7.1 etc.) are preferred over bare 5xx.
- */
 function parseSMTPCode(code: number, line: string): SmtpVerdict | null {
   if (code === 250) return "accepted";
   if (code >= 400 && code < 500) return "greylisted";
-
   if (code >= 500) {
-    // Look for enhanced status code (e.g. "550 5.1.1 ...")
     const enhanced = line.match(/5\.([0-9])\.([0-9]+)/);
     if (enhanced) {
-      const cat = enhanced[1]; // category: 1=address, 7=policy, etc.
-      const detail = enhanced[2];
-      if (cat === "1") return "invalid_mailbox"; // 5.1.x = address problem
-      if (cat === "7") return "policy_block";    // 5.7.x = policy/auth/spam
+      const cat = enhanced[1];
+      if (cat === "1") return "invalid_mailbox";
+      if (cat === "7") return "policy_block";
     }
-    // Bare 5xx without enhanced code
     if (code === 550 || code === 551 || code === 553) return "invalid_mailbox";
     if (code === 554 || code === 556) return "invalid_mailbox";
-    if (code === 552 || code === 555) return "rejected_other";
     return "rejected_other";
   }
   return null;
 }
 
-/**
- * Single-port SMTP probe. Returns a SmtpResult.
- */
+// Rotate EHLO hostnames to reduce fingerprinting
+const EHLO_NAMES = ["verifeye.io", "mail.verifeye.io", "outbound.verifeye.io"];
+function randomEhlo(): string {
+  return EHLO_NAMES[Math.floor(Math.random() * EHLO_NAMES.length)];
+}
+
+// Jitter delay between commands (50–250ms) — mimics human MTA behaviour
+function jitter(minMs = 50, maxMs = 250): Promise<void> {
+  return new Promise((r) => setTimeout(r, minMs + Math.random() * (maxMs - minMs)));
+}
+
 function smtpProbe(
   mxHost: string,
   email: string,
   port: number,
-  timeoutMs = 5000,
+  timeoutMs = 6000,
 ): Promise<SmtpResult> {
   return new Promise((resolve) => {
     let resolved = false;
     let buffer = "";
     let step = 0;
-    let rcptAccepted = false;
     let socket: net.Socket;
 
     const done = (result: SmtpResult) => {
       if (!resolved) {
         resolved = true;
-        if (socket && !socket.destroyed) socket.destroy();
+        if (socket && !socket.destroyed) {
+          // Politely QUIT before closing (reduces blacklisting risk vs. hard destroy)
+          try { socket.write("QUIT\r\n"); } catch (_) {}
+          setTimeout(() => { if (!socket.destroyed) socket.destroy(); }, 500);
+        }
         resolve(result);
       }
     };
@@ -287,11 +418,10 @@ function smtpProbe(
     socket.on("connect", () =>
       console.log(`[VerifEye] SMTP connected ${mxHost}:${port}`));
 
-    socket.on("data", (chunk) => {
+    socket.on("data", async (chunk) => {
       buffer += chunk.toString();
-      // Process all complete response lines
       const lines = buffer.split("\n");
-      buffer = lines.pop() ?? ""; // keep partial last line
+      buffer = lines.pop() ?? "";
 
       for (const rawLine of lines) {
         const line = rawLine.trim();
@@ -300,20 +430,20 @@ function smtpProbe(
         const code = parseInt(line.substring(0, 3));
         if (isNaN(code)) continue;
 
-        // Multi-line responses: only act on the final line (no dash after code)
         const isLastLine = line[3] !== "-";
         if (!isLastLine) continue;
 
-        // --- SMTP conversation state machine ---
         if (step === 0) {
           if (code === 220) {
-            socket.write(`EHLO verifeye.io\r\n`);
+            await jitter();
+            socket.write(`EHLO ${randomEhlo()}\r\n`);
             step = 1;
           } else {
             done({ verdict: "error", message: `Unexpected greeting (${code})`, catchAll: false });
           }
         } else if (step === 1) {
           if (code === 250) {
+            await jitter();
             socket.write(`MAIL FROM:<probe@verifeye.io>\r\n`);
             step = 2;
           } else {
@@ -321,6 +451,7 @@ function smtpProbe(
           }
         } else if (step === 2) {
           if (code === 250) {
+            await jitter();
             socket.write(`RCPT TO:<${email}>\r\n`);
             step = 3;
           } else {
@@ -330,20 +461,18 @@ function smtpProbe(
         } else if (step === 3) {
           const verdict = parseSMTPCode(code, line);
           if (verdict === "accepted") {
-            rcptAccepted = true;
-            // Catch-all probe: try a definitely-fake address
-            const randAddr = `nonexistent_probe_${Date.now()}@${email.split("@")[1]}`;
+            await jitter();
+            const randAddr = `nvp_${Date.now()}_${Math.random().toString(36).slice(2)}@${email.split("@")[1]}`;
             socket.write(`RCPT TO:<${randAddr}>\r\n`);
             step = 4;
           } else {
             done({ verdict: verdict ?? "rejected_other", message: line, catchAll: false });
           }
         } else if (step === 4) {
-          // Catch-all probe response
           const fakePassed = code === 250;
           done({
             verdict: fakePassed ? "catch_all" : "accepted",
-            message: fakePassed ? "Server accepts all addresses (catch-all)" : "Mailbox confirmed",
+            message: fakePassed ? "Catch-all domain" : "Mailbox confirmed",
             catchAll: fakePassed,
           });
         }
@@ -363,34 +492,27 @@ function smtpProbe(
   });
 }
 
-/**
- * Multi-port SMTP check: try port 25 first, fall back to 587 if blocked/timeout.
- * This mirrors the strategy used by professional verifiers like Verifalia.
- */
 async function smtpCheck(mxHost: string, email: string): Promise<SmtpResult> {
-  // Try port 25 first (standard MTA port)
-  const port25 = await smtpProbe(mxHost, email, 25, 5000);
+  const port25 = await smtpProbe(mxHost, email, 25, 6000);
   console.log(`[VerifEye] Port 25 verdict: ${port25.verdict}`);
 
   if (port25.verdict !== "blocked" && port25.verdict !== "timeout") {
-    return port25; // Conclusive result — use it
+    return port25;
   }
 
-  // Port 25 blocked → try port 587 (submission port)
-  console.log(`[VerifEye] Port 25 unavailable, trying port 587...`);
-  const port587 = await smtpProbe(mxHost, email, 587, 5000);
+  console.log(`[VerifEye] Port 25 unavailable, trying 587...`);
+  const port587 = await smtpProbe(mxHost, email, 587, 6000);
   console.log(`[VerifEye] Port 587 verdict: ${port587.verdict}`);
 
-  // If 587 also blocked/timeout, return blocked (use DNS-only result)
   if (port587.verdict === "blocked" || port587.verdict === "timeout") {
-    return { verdict: "blocked", message: "Port 25 and 587 both unreachable", catchAll: false };
+    return { verdict: "blocked", message: "Ports 25 and 587 both unreachable", catchAll: false };
   }
 
   return port587;
 }
 
 // ---------------------------------------------------------------------------
-// Core verification logic
+// Result types — enhanced with confidence scoring
 // ---------------------------------------------------------------------------
 export type EmailStatus = "Valid" | "Invalid" | "Risky" | "Unknown";
 
@@ -400,15 +522,24 @@ export interface EmailVerificationResult {
   reason: string;
   domain: string;
   providerType: string;
+  detectedProvider: string | null;
+  confidenceScore: number;
+  flags: string[];
+  typoSuggestion: string | null;
   details: {
     syntax: boolean;
     dns: boolean;
     smtp: boolean;
     catchAll: boolean;
     mxRecords: Array<{ exchange: string; priority: number }>;
+    smtpVerdict: string;
+    smtpSkipped: boolean;
   };
 }
 
+// ---------------------------------------------------------------------------
+// Core verification engine
+// ---------------------------------------------------------------------------
 async function verifySingleEmail(email: string): Promise<EmailVerificationResult> {
   console.log(`[VerifEye] Verifying: ${email}`);
 
@@ -418,12 +549,25 @@ async function verifySingleEmail(email: string): Promise<EmailVerificationResult
     reason: "",
     domain: "",
     providerType: "unknown",
-    details: { syntax: false, dns: false, smtp: false, catchAll: false, mxRecords: [] },
+    detectedProvider: null,
+    confidenceScore: 0,
+    flags: [],
+    typoSuggestion: null,
+    details: {
+      syntax: false,
+      dns: false,
+      smtp: false,
+      catchAll: false,
+      mxRecords: [],
+      smtpVerdict: "not_run",
+      smtpSkipped: false,
+    },
   };
 
-  // 1. Syntax
+  // ─── Layer 1: Syntax ────────────────────────────────────────────────────
   if (!email || !validator.isEmail(email)) {
     base.reason = "Invalid email syntax";
+    base.confidenceScore = 0;
     return base;
   }
   base.details.syntax = true;
@@ -432,122 +576,190 @@ async function verifySingleEmail(email: string): Promise<EmailVerificationResult
   const prefix = email.split("@")[0].toLowerCase();
   base.domain = domain;
 
-  // 2. Disposable check (fast path before DNS)
+  // ─── Flag: Typo domain detection ────────────────────────────────────────
+  const typoSuggestion = detectTypoDomain(domain);
+  if (typoSuggestion) {
+    base.typoSuggestion = typoSuggestion;
+    base.flags.push("possible_typo");
+    console.log(`[VerifEye] Typo detected: ${domain} → ${typoSuggestion}`);
+  }
+
+  // ─── Layer 2: Disposable check (fast path) ──────────────────────────────
   if (DISPOSABLE_DOMAINS.has(domain)) {
     base.status = "Risky";
     base.providerType = "disposable";
-    base.reason = "Disposable / temporary email provider";
-    // Still resolve MX for completeness
+    base.flags.push("disposable");
+    base.reason = "Disposable / temporary email provider — high bounce risk";
     try {
-      const mx = await resolveMx(domain);
+      const mx = await resolveMxCached(domain);
       base.details.mxRecords = mx;
       base.details.dns = mx.length > 0;
     } catch (_) {}
+    base.confidenceScore = calculateConfidenceScore({
+      syntaxValid: true, mxFound: base.details.dns,
+      smtpAccepted: false, catchAll: false, roleBased: false,
+      disposable: true, freeProvider: false, educationalDomain: false,
+      businessDomain: false, typoDomain: !!typoSuggestion,
+      smtpBlocking: false, greylisted: false, policyBlock: false,
+    });
     return base;
   }
 
-  // 3. Role-based prefix check
+  // ─── Flag: Role-based prefix ────────────────────────────────────────────
   const isRoleBased = ROLE_PREFIXES.has(prefix);
+  if (isRoleBased) base.flags.push("role_based");
 
-  // 4. DNS / MX
+  // ─── Layer 3: DNS / MX resolution ───────────────────────────────────────
   let mxRecords: dns.MxRecord[] = [];
   try {
-    mxRecords = await resolveMx(domain);
-  } catch (dnsErr: any) {
-    // A-record fallback
+    mxRecords = await resolveMxCached(domain);
+  } catch {
     try {
       const aRecs = await resolveA(domain);
-      if (aRecs.length > 0) {
-        mxRecords = [{ exchange: domain, priority: 10 }];
-      }
+      if (aRecs.length > 0) mxRecords = [{ exchange: domain, priority: 10 }];
     } catch (_) {}
+  }
 
-    if (mxRecords.length === 0) {
-      base.reason = "Domain has no mail servers (no MX or A records found)";
-      return base;
-    }
+  if (mxRecords.length === 0) {
+    base.reason = typoSuggestion
+      ? `Domain "${domain}" has no mail servers — did you mean "${typoSuggestion}"?`
+      : "Domain has no mail servers (no MX or A records)";
+    base.confidenceScore = 0;
+    return base;
   }
 
   const mxExchanges = mxRecords.map((r) => r.exchange);
   base.details.mxRecords = mxRecords;
-  base.details.dns = mxRecords.length > 0;
+  base.details.dns = true;
   base.providerType = classifyProvider(domain, mxExchanges);
 
-  // Detect specific mail provider from MX fingerprint
   const mxProvider = detectProviderFromMx(mxExchanges);
-  const isFreeProvider = base.providerType === "free";
-  const isSmtpBlocking = isFreeProvider &&
-    (mxProvider ? SMTP_BLOCKING_PROVIDERS.has(mxProvider) : true);
+  base.detectedProvider = mxProvider;
 
-  // 5. SMTP check
-  const primaryMx = mxRecords.sort((a, b) => a.priority - b.priority)[0].exchange;
-  const smtp = await smtpCheck(primaryMx, email);
+  // Flag free providers
+  const isFreeProvider = base.providerType === "free";
+  if (isFreeProvider) base.flags.push("free_provider");
+
+  const isSmtpBlocking = SMTP_BLOCKING_PROVIDERS.has(mxProvider ?? "");
+  const isEducational = isEducationalDomain(domain);
+  const isBusinessDomain = base.providerType === "business";
+
+  // ─── Layer 4: Provider short-circuit (Yahoo/Gmail/MS etc.) ──────────────
+  // These providers block or lie during SMTP probing — never probe them.
+  // Use heuristic scoring instead.
+  if (isSmtpBlocking) {
+    base.details.smtpSkipped = true;
+    base.details.smtpVerdict = "skipped_blocking_provider";
+
+    const score = calculateConfidenceScore({
+      syntaxValid: true, mxFound: true,
+      smtpAccepted: false, catchAll: false,
+      roleBased: isRoleBased, disposable: false, freeProvider: true,
+      educationalDomain: false, businessDomain: false,
+      typoDomain: !!typoSuggestion, smtpBlocking: true,
+      greylisted: false, policyBlock: false,
+    });
+
+    base.confidenceScore = score;
+    base.status = scoreToStatus(score);
+
+    const providerName = mxProvider
+      ? ({ google: "Gmail/Google Workspace", yahoo: "Yahoo Mail", microsoft: "Outlook/Hotmail/Microsoft 365", icloud: "iCloud Mail", protonmail: "ProtonMail" }[mxProvider] ?? mxProvider)
+      : domain;
+
+    base.reason = [
+      `${providerName} blocks all external SMTP verification — this is their anti-spam policy, not a rejection of this address.`,
+      `Syntax and MX records are valid. Confidence: ${score}/100.`,
+      isRoleBased ? `Role-based address (${prefix}@) — may not reach a personal inbox.` : "",
+      typoSuggestion ? `Possible typo detected — did you mean "${typoSuggestion}"?` : "",
+    ].filter(Boolean).join(" ");
+
+    return base;
+  }
+
+  // ─── Layer 5: SMTP probe (business/non-blocking domains only) ───────────
+  const primaryMx = [...mxRecords].sort((a, b) => a.priority - b.priority)[0].exchange;
+  let smtp: SmtpResult = { verdict: "error", message: "Rate-limited", catchAll: false };
+
+  if (canSmtpProbe(domain)) {
+    smtp = await smtpCheck(primaryMx, email);
+  } else {
+    console.warn(`[VerifEye] SMTP rate limit hit for ${domain} — skipping probe`);
+    smtp = { verdict: "blocked", message: "Domain SMTP rate limit reached", catchAll: false };
+  }
+
   base.details.smtp = smtp.verdict === "accepted" || smtp.verdict === "catch_all";
   base.details.catchAll = smtp.catchAll;
+  base.details.smtpVerdict = smtp.verdict;
 
-  // 6. Final classification (Verifalia-style verdict mapping)
+  if (smtp.verdict === "catch_all") base.flags.push("catch_all");
+
+  // ─── Layer 6: Confidence scoring + status classification ────────────────
+  const factors: ScoreFactors = {
+    syntaxValid: true,
+    mxFound: true,
+    smtpAccepted: smtp.verdict === "accepted" || smtp.verdict === "catch_all",
+    catchAll: smtp.catchAll,
+    roleBased: isRoleBased,
+    disposable: false,
+    freeProvider: isFreeProvider,
+    educationalDomain: isEducational,
+    businessDomain: isBusinessDomain,
+    typoDomain: !!typoSuggestion,
+    smtpBlocking: false,
+    greylisted: smtp.verdict === "greylisted",
+    policyBlock: smtp.verdict === "policy_block",
+  };
+
+  const score = calculateConfidenceScore(factors);
+  base.confidenceScore = score;
+
   switch (smtp.verdict) {
     case "accepted":
-      if (isRoleBased) {
-        base.status = "Risky";
-        base.reason = `Role-based address (${prefix}@) — may not reach a personal inbox`;
-      } else {
-        base.status = "Valid";
-        base.reason = "Syntax OK, MX records found, SMTP accepted the recipient";
-      }
+      base.status = isRoleBased ? "Risky" : scoreToStatus(score);
+      base.reason = isRoleBased
+        ? `Role-based address (${prefix}@) — mailbox accepted but may not reach a personal inbox. Confidence: ${score}/100.`
+        : `Syntax OK, MX records found, SMTP accepted the recipient. Confidence: ${score}/100.`;
       break;
 
     case "catch_all":
       base.status = "Risky";
-      base.reason = "Catch-all domain — server accepts all addresses, mailbox existence unverifiable";
+      base.reason = `Catch-all domain — server accepts all addresses, mailbox existence unverifiable. Confidence: ${score}/100.`;
       break;
 
     case "invalid_mailbox":
-      if (isSmtpBlocking) {
-        // Major providers use 5.1.1 to block probes, not to report invalid users
-        base.status = "Unknown";
-        base.reason = `${mxProvider ?? domain} restricts SMTP verification — address syntax and DNS are valid`;
-      } else {
-        base.status = "Invalid";
-        base.reason = `Mailbox does not exist: ${smtp.message}`;
-      }
+      base.status = "Invalid";
+      base.confidenceScore = 0;
+      base.reason = `Mailbox does not exist: ${smtp.message}`;
       break;
 
     case "policy_block":
-      // 5.7.x — server rejected the probe for policy reasons, NOT because the address is invalid
-      base.status = "Unknown";
-      base.reason = `Server policy blocked the verification probe (5.7.x) — address may be valid`;
+      base.status = scoreToStatus(score);
+      base.reason = `Server policy blocked the probe (5.7.x) — address may be valid. Confidence: ${score}/100.`;
       break;
 
     case "greylisted":
-      // 4xx — temporary deferral; classic greylisting behaviour
       base.status = "Unknown";
-      base.reason = "Server temporarily deferred the check (greylisting) — likely valid, retry later";
+      base.reason = `Server temporarily deferred the check (greylisting) — likely valid, retry queued. Confidence: ${score}/100.`;
       break;
 
     case "blocked":
     case "timeout":
-      if (isSmtpBlocking) {
-        // Known SMTP-blocking provider + network block → high confidence it's fine
-        base.status = "Unknown";
-        base.reason = `${mxProvider ?? domain} infrastructure blocks external SMTP probes — DNS is valid`;
-      } else if (isRoleBased) {
-        base.status = "Risky";
-        base.reason = `Role-based address (${prefix}@). SMTP unreachable — DNS is valid`;
-      } else {
-        base.status = "Unknown";
-        base.reason = "SMTP port 25 and 587 both unreachable — DNS valid but inbox unverifiable";
-      }
+      base.status = scoreToStatus(score);
+      base.reason = `SMTP unreachable (ports 25 and 587 blocked) — DNS is valid. Confidence: ${score}/100.`;
       break;
 
     default:
       base.status = "Unknown";
-      base.reason = `SMTP check inconclusive: ${smtp.message}`;
+      base.reason = `SMTP check inconclusive: ${smtp.message}. Confidence: ${score}/100.`;
       break;
   }
 
-  if (base.providerType === "educational") {
+  if (isEducational) {
     base.reason = `[Educational institution] ${base.reason}`;
+  }
+  if (typoSuggestion && smtp.verdict !== "invalid_mailbox") {
+    base.reason += ` Possible typo — did you mean "${typoSuggestion}"?`;
   }
 
   return base;
@@ -569,10 +781,18 @@ async function verifyBatch(emails: string[]): Promise<EmailVerificationResult[]>
         results.push({
           email: batch[j],
           status: "Unknown",
-          reason: "Verification process failed unexpectedly",
+          reason: "Verification failed unexpectedly",
           domain: batch[j].split("@")[1] || "",
           providerType: "unknown",
-          details: { syntax: false, dns: false, smtp: false, catchAll: false, mxRecords: [] },
+          detectedProvider: null,
+          confidenceScore: 0,
+          flags: [],
+          typoSuggestion: null,
+          details: {
+            syntax: false, dns: false, smtp: false,
+            catchAll: false, mxRecords: [],
+            smtpVerdict: "error", smtpSkipped: false,
+          },
         });
       }
     }
@@ -580,35 +800,38 @@ async function verifyBatch(emails: string[]): Promise<EmailVerificationResult[]>
   return results;
 }
 
+// Register the smtpCheck function with the retry queue (avoids circular import)
+registerSmtpProbe(async (email: string) => {
+  const domain = email.split("@")[1];
+  const mx = await resolveMxCached(domain);
+  const primaryMx = [...mx].sort((a, b) => a.priority - b.priority)[0].exchange;
+  return smtpCheck(primaryMx, email);
+});
+
 // ---------------------------------------------------------------------------
 // API Routes
 // ---------------------------------------------------------------------------
 
-// ---- Auth Routes ----
+// ── Auth ────────────────────────────────────────────────────────────────────
 app.post("/api/auth/login", async (req: Request, res: Response) => {
   const { email, password } = req.body;
   if (!email || !password) return res.status(400).json({ error: "Missing email or password" });
-
   try {
     const db = await getDb();
     const user = await db.get("SELECT * FROM users WHERE email = ?", [email]);
     if (!user) return res.status(401).json({ error: "Invalid email or password" });
-
     const valid = await bcrypt.compare(password, user.password_hash);
     if (!valid) return res.status(401).json({ error: "Invalid email or password" });
-
-    const token = jwt.sign({ id: user.id, email: user.email, role: user.role, limit: user.daily_limit }, JWT_SECRET, { expiresIn: '1d' });
+    const token = jwt.sign({ id: user.id, email: user.email, role: user.role, limit: user.daily_limit }, JWT_SECRET, { expiresIn: "1d" });
     res.cookie("token", token, { httpOnly: true, sameSite: "strict" });
-    
-    // get user without password_hash
     const { password_hash, ...safeUser } = user;
     res.json({ user: safeUser });
-  } catch (err) {
+  } catch {
     res.status(500).json({ error: "Server error" });
   }
 });
 
-app.post("/api/auth/logout", (req, res) => {
+app.post("/api/auth/logout", (_req, res) => {
   res.clearCookie("token");
   res.json({ success: true });
 });
@@ -623,18 +846,18 @@ app.get("/api/auth/me", requireAuth, async (req: AuthRequest, res: Response) => 
     } else {
       res.status(404).json({ error: "User not found" });
     }
-  } catch(e) {
-    res.status(500).json({error: "Server error"});
+  } catch {
+    res.status(500).json({ error: "Server error" });
   }
 });
 
-// ---- User/Settings Routes ----
-app.get("/api/users", requireAuth, requireAdmin, async (req, res) => {
+// ── Users ────────────────────────────────────────────────────────────────────
+app.get("/api/users", requireAuth, requireAdmin, async (_req, res) => {
   try {
     const db = await getDb();
     const users = await db.all("SELECT id, email, role, daily_limit, emails_checked_today, last_check_date FROM users");
     res.json(users);
-  } catch(e) { res.status(500).json({error: "Server error"}); }
+  } catch { res.status(500).json({ error: "Server error" }); }
 });
 
 app.post("/api/users", requireAuth, requireAdmin, async (req, res) => {
@@ -645,7 +868,7 @@ app.post("/api/users", requireAuth, requireAdmin, async (req, res) => {
     const hash = await bcrypt.hash(password, 10);
     const result = await db.run("INSERT INTO users (email, password_hash, role, daily_limit) VALUES (?, ?, 'USER', ?)", [email, hash, parseInt(limit) || -1]);
     res.json({ success: true, id: result.lastID });
-  } catch(e: any) {
+  } catch (e: any) {
     res.status(400).json({ error: e.message });
   }
 });
@@ -656,81 +879,92 @@ app.put("/api/users/:id/limit", requireAuth, requireAdmin, async (req, res) => {
     const db = await getDb();
     await db.run("UPDATE users SET daily_limit = ? WHERE id = ?", [parseInt(daily_limit), req.params.id]);
     res.json({ success: true });
-  } catch(e) { res.status(500).json({error: "Server error"}); }
+  } catch { res.status(500).json({ error: "Server error" }); }
 });
+
 app.delete("/api/users/:id", requireAuth, requireAdmin, async (req: AuthRequest, res) => {
   try {
     const db = await getDb();
     await db.run("DELETE FROM logs WHERE user_id = ?", [req.params.id]);
     await db.run("DELETE FROM users WHERE id = ?", [req.params.id]);
     res.json({ success: true });
-  } catch(e) { res.status(500).json({error: "Server error"}); }
+  } catch { res.status(500).json({ error: "Server error" }); }
 });
 
 app.put("/api/users/:id/password", requireAuth, requireAdmin, async (req: AuthRequest, res) => {
   const { newPassword } = req.body;
-  if(!newPassword) return res.status(400).json({error: "Missing password field"});
+  if (!newPassword) return res.status(400).json({ error: "Missing password field" });
   try {
     const db = await getDb();
     const hash = await bcrypt.hash(newPassword, 10);
     await db.run("UPDATE users SET password_hash = ? WHERE id = ?", [hash, req.params.id]);
     res.json({ success: true });
-  } catch(e) { res.status(500).json({error: "Server error"}); }
+  } catch { res.status(500).json({ error: "Server error" }); }
 });
 
 app.put("/api/users/password", requireAuth, async (req: AuthRequest, res) => {
   const { currentPassword, newPassword } = req.body;
-  if(!currentPassword || !newPassword) return res.status(400).json({error: "Missing fields"});
+  if (!currentPassword || !newPassword) return res.status(400).json({ error: "Missing fields" });
   try {
     const db = await getDb();
     const user = await db.get("SELECT * FROM users WHERE id = ?", [req.user.id]);
     const valid = await bcrypt.compare(currentPassword, user.password_hash);
     if (!valid) return res.status(400).json({ error: "Incorrect current password" });
-    
     const hash = await bcrypt.hash(newPassword, 10);
     await db.run("UPDATE users SET password_hash = ? WHERE id = ?", [hash, req.user.id]);
     res.json({ success: true });
-  } catch(e) { res.status(500).json({error: "Server error"}); }
+  } catch { res.status(500).json({ error: "Server error" }); }
 });
 
-// ---- Logs Routes ----
+// ── Logs ─────────────────────────────────────────────────────────────────────
 app.get("/api/logs", requireAuth, async (req: AuthRequest, res) => {
   try {
     const db = await getDb();
     let logs;
-    // Admin sees all logs, user sees own logs
     if (req.user.role === "ADMIN") {
       logs = await db.all(`
-        SELECT logs.id, logs.email, logs.status, logs.timestamp, users.email as checked_by 
-        FROM logs 
-        JOIN users ON logs.user_id = users.id 
+        SELECT logs.id, logs.email, logs.status, logs.confidence_score, logs.flags, logs.timestamp,
+               users.email as checked_by
+        FROM logs
+        JOIN users ON logs.user_id = users.id
         ORDER BY timestamp DESC LIMIT 500
       `);
     } else {
       logs = await db.all(`
-        SELECT id, email, status, timestamp 
-        FROM logs 
-        WHERE user_id = ? 
+        SELECT id, email, status, confidence_score, flags, timestamp
+        FROM logs
+        WHERE user_id = ?
         ORDER BY timestamp DESC LIMIT 500
       `, [req.user.id]);
     }
     res.json(logs);
-  } catch(e) { res.status(500).json({error: "Server error"}); }
+  } catch { res.status(500).json({ error: "Server error" }); }
 });
 
-// ---- Verification Routes ----
+// ── Verification ──────────────────────────────────────────────────────────────
 app.post("/api/verify", rateLimit, requireAuth, async (req: AuthRequest, res: Response) => {
   try {
     const { email } = req.body;
     if (!email || typeof email !== "string") return res.status(400).json({ error: "email field is required" });
-    
+
     const db = await getDb();
     const canCheck = await checkAndLogLimit(db, req.user.id, 1);
     if (!canCheck) return res.status(403).json({ error: "Daily verification limit reached." });
 
     const result = await verifySingleEmail(email.trim());
-    await db.run("INSERT INTO logs (user_id, email, status) VALUES (?, ?, ?)", [req.user.id, result.email, result.status]);
-    return res.json(result);
+
+    // Save with enriched data
+    const logResult = await db.run(
+      "INSERT INTO logs (user_id, email, status, confidence_score, flags) VALUES (?, ?, ?, ?, ?)",
+      [req.user.id, result.email, result.status, result.confidenceScore, JSON.stringify(result.flags)]
+    );
+
+    // Enqueue greylisted emails for automatic retry
+    if (result.details.smtpVerdict === "greylisted") {
+      await enqueueRetry(result.email, req.user.id);
+    }
+
+    return res.json({ ...result, logId: logResult.lastID });
   } catch (error: any) {
     console.error("[VerifEye] /api/verify error:", error);
     return res.status(500).json({ error: "Internal server error" });
@@ -743,7 +977,6 @@ app.post("/api/verify-bulk", rateLimit, requireAuth, async (req: AuthRequest, re
     if (!Array.isArray(emails)) return res.status(400).json({ error: "emails must be an array" });
 
     const trimmed = emails.map((e: unknown) => (typeof e === "string" ? e.trim() : "")).filter(Boolean).slice(0, MAX_BULK);
-    
     if (trimmed.length === 0) return res.json({ results: [], total: 0 });
 
     const db = await getDb();
@@ -751,10 +984,13 @@ app.post("/api/verify-bulk", rateLimit, requireAuth, async (req: AuthRequest, re
     if (!canCheck) return res.status(403).json({ error: `Daily limit exceeded. Cannot process ${trimmed.length} emails.` });
 
     const results = await verifyBatch(trimmed);
-    
-    const stmt = await db.prepare("INSERT INTO logs (user_id, email, status) VALUES (?, ?, ?)");
+
+    const stmt = await db.prepare("INSERT INTO logs (user_id, email, status, confidence_score, flags) VALUES (?, ?, ?, ?, ?)");
     for (const r of results) {
-      await stmt.run([req.user.id, r.email, r.status]);
+      await stmt.run([req.user.id, r.email, r.status, r.confidenceScore, JSON.stringify(r.flags)]);
+      if (r.details.smtpVerdict === "greylisted") {
+        await enqueueRetry(r.email, req.user.id);
+      }
     }
     await stmt.finalize();
 
@@ -765,8 +1001,69 @@ app.post("/api/verify-bulk", rateLimit, requireAuth, async (req: AuthRequest, re
   }
 });
 
+// ── Deep (real-email) verification ────────────────────────────────────────────
+app.post("/api/verify/deep", rateLimit, requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const { email, logId } = req.body;
+    if (!email || typeof email !== "string") return res.status(400).json({ error: "email is required" });
+    if (!MAILER_ENABLED) {
+      return res.status(503).json({
+        error: "Deep verification is not configured. Add SMTP credentials to .env to enable this feature.",
+        disabled: true,
+      });
+    }
+
+    const numericLogId = parseInt(logId ?? "0");
+    const result = await sendDeepVerification(email.trim(), numericLogId);
+    return res.json({ success: true, queueId: result.queueId, message: "Verification email queued successfully." });
+  } catch (error: any) {
+    console.error("[VerifEye] /api/verify/deep error:", error);
+    return res.status(500).json({ error: "Failed to queue deep verification" });
+  }
+});
+
+app.get("/api/verify/deep/:id", requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const status = await getDeepVerificationStatus(parseInt(req.params.id));
+    if (!status) return res.status(404).json({ error: "Not found" });
+    return res.json(status);
+  } catch {
+    return res.status(500).json({ error: "Server error" });
+  }
+});
+
+// ── Tracking pixel ────────────────────────────────────────────────────────────
+const PIXEL_GIF = Buffer.from(
+  "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7",
+  "base64"
+);
+
+app.get("/api/tracking/pixel/:token", async (req, res) => {
+  try {
+    await markPixelDelivered(req.params.token);
+  } catch (_) {}
+  res.set({
+    "Content-Type": "image/gif",
+    "Cache-Control": "no-cache, no-store, must-revalidate",
+    Pragma: "no-cache",
+    Expires: "0",
+    "Content-Length": PIXEL_GIF.length.toString(),
+  });
+  res.end(PIXEL_GIF);
+});
+
+// ── Admin: retry queue status ─────────────────────────────────────────────────
+app.get("/api/retry-queue", requireAuth, requireAdmin, async (_req, res) => {
+  try {
+    const jobs = await getPendingJobs();
+    res.json(jobs);
+  } catch {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
 // ---------------------------------------------------------------------------
-// Start server
+// Server startup
 // ---------------------------------------------------------------------------
 async function startServer() {
   if (process.env.NODE_ENV !== "production") {
@@ -781,6 +1078,8 @@ async function startServer() {
 
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`[VerifEye] Server running on http://localhost:${PORT}`);
+    console.log(`[VerifEye] Deep email verification: ${MAILER_ENABLED ? "ENABLED" : "DISABLED (no SMTP config)"}`);
+    startRetryQueue();
   });
 }
 

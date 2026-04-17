@@ -3,15 +3,15 @@ import { open } from "sqlite";
 import bcrypt from "bcryptjs";
 
 async function runMigration() {
-  console.log("[Migration] Starting database migration...");
+  console.log("[Migration] Starting VerifEye database migration v2...");
 
   const db = await open({
     filename: "database.sqlite",
     driver: sqlite3.Database,
   });
 
-  // 1. Ensure `users` table exists
-  console.log("[Migration] Ensuring users table exists...");
+  // ── 1. Ensure users table exists ──────────────────────────────────────────
+  console.log("[Migration] Ensuring users table...");
   await db.exec(`
     CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -24,10 +24,10 @@ async function runMigration() {
     );
   `);
 
-  // 2. Ensure default admin user exists (since old logs need a user_id)
+  // ── 2. Ensure default admin exists ────────────────────────────────────────
   let admin = await db.get("SELECT id FROM users ORDER BY id ASC LIMIT 1");
   if (!admin) {
-    console.log("[Migration] Interjecting default admin to own legacy logs...");
+    console.log("[Migration] Creating default admin user...");
     const defaultPasswordHash = await bcrypt.hash("asdQWE123#", 10);
     const result = await db.run(
       `INSERT INTO users (email, password_hash, role, daily_limit) VALUES (?, ?, ?, ?)`,
@@ -36,83 +36,132 @@ async function runMigration() {
     admin = { id: result.lastID };
     console.log(`[Migration] Default admin created with ID ${admin.id}.`);
   } else {
-    console.log(`[Migration] Admin user found with ID ${admin.id}. Legacy logs will map to this user.`);
+    console.log(`[Migration] Admin user found with ID ${admin.id}.`);
   }
 
   const legacyUserId = admin.id;
 
-  // 3. Inspect the current `logs` table schema
-  console.log("[Migration] Checking current logs table schema...");
-  let needsMigration = false;
-  
+  // ── 3. Migrate logs table — add user_id if missing ────────────────────────
+  console.log("[Migration] Checking logs table schema...");
+  let needsUserIdMigration = false;
+  let needsConfidenceMigration = false;
+  let needsFlagsMigration = false;
+
   try {
     const tableInfo = await db.all("PRAGMA table_info(logs)");
-    if (tableInfo.length > 0) {
-      const hasUserId = tableInfo.some((col: any) => col.name === "user_id");
-      if (!hasUserId) {
-        needsMigration = true;
-      }
-    } else {
-      console.log("[Migration] 'logs' table does not exist. Creating fresh schema...");
+
+    if (tableInfo.length === 0) {
+      console.log("[Migration] logs table does not exist — creating fresh...");
       await db.exec(`
         CREATE TABLE logs (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           user_id INTEGER NOT NULL,
           email TEXT NOT NULL,
           status TEXT NOT NULL,
+          confidence_score INTEGER,
+          flags TEXT,
           timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
           FOREIGN KEY (user_id) REFERENCES users (id)
         );
       `);
-      console.log("[Migration] Fresh logs table initialized. No migration needed.");
-      return;
+      console.log("[Migration] Fresh logs table created.");
+    } else {
+      const cols = tableInfo.map((c: any) => c.name);
+      needsUserIdMigration = !cols.includes("user_id");
+      needsConfidenceMigration = !cols.includes("confidence_score");
+      needsFlagsMigration = !cols.includes("flags");
     }
   } catch (err) {
     console.log("[Migration] Assuming fresh deployment.");
   }
 
-  // 4. Perform the structured database migration if `user_id` does not exist
-  if (needsMigration) {
-    console.log("[Migration] 'user_id' column missing in legacy 'logs' table. Proceeding with table migration...");
-    
-    // SQLite drops limitations mean we will rename and recreate the table
+  // ── 3a. Migrate legacy logs without user_id ───────────────────────────────
+  if (needsUserIdMigration) {
+    console.log("[Migration] Adding user_id to logs table...");
     await db.exec("BEGIN TRANSACTION");
-
     try {
-      // Create new table
       await db.exec(`
         CREATE TABLE logs_new (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           user_id INTEGER NOT NULL,
           email TEXT NOT NULL,
           status TEXT NOT NULL,
+          confidence_score INTEGER,
+          flags TEXT,
           timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
           FOREIGN KEY (user_id) REFERENCES users (id)
         );
       `);
-      
-      // Copy data mapping them to `legacyUserId`
-      const migrationResult = await db.run(`
+      const migResult = await db.run(`
         INSERT INTO logs_new (id, user_id, email, status, timestamp)
         SELECT id, ?, email, status, timestamp FROM logs
       `, [legacyUserId]);
-      
-      console.log(`[Migration] Migrated ${migrationResult.changes} legacy logs.`);
-
-      // Swap tables
+      console.log(`[Migration] Migrated ${migResult.changes} legacy log rows.`);
       await db.exec("DROP TABLE logs;");
       await db.exec("ALTER TABLE logs_new RENAME TO logs;");
-      
       await db.exec("COMMIT");
-      console.log("[Migration] Migration completed successfully.");
+      console.log("[Migration] user_id migration complete.");
     } catch (error) {
       await db.exec("ROLLBACK");
-      console.error("[Migration] Migration aborted due to an error.", error);
+      console.error("[Migration] user_id migration failed:", error);
     }
-  } else {
-    console.log("[Migration] 'logs' table already contains 'user_id'. No migration needed.");
   }
 
+  // ── 3b. Add confidence_score column if missing ────────────────────────────
+  if (needsConfidenceMigration && !needsUserIdMigration) {
+    console.log("[Migration] Adding confidence_score column to logs...");
+    try {
+      await db.exec("ALTER TABLE logs ADD COLUMN confidence_score INTEGER DEFAULT NULL");
+      console.log("[Migration] confidence_score column added.");
+    } catch (err: any) {
+      if (!err.message?.includes("duplicate column")) throw err;
+    }
+  }
+
+  // ── 3c. Add flags column if missing ──────────────────────────────────────
+  if (needsFlagsMigration && !needsUserIdMigration) {
+    console.log("[Migration] Adding flags column to logs...");
+    try {
+      await db.exec("ALTER TABLE logs ADD COLUMN flags TEXT DEFAULT NULL");
+      console.log("[Migration] flags column added.");
+    } catch (err: any) {
+      if (!err.message?.includes("duplicate column")) throw err;
+    }
+  }
+
+  // ── 4. New tables — verification_queue and retry_queue ───────────────────
+  console.log("[Migration] Ensuring verification_queue table...");
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS verification_queue (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      log_id INTEGER REFERENCES logs(id),
+      email TEXT NOT NULL,
+      tracking_token TEXT UNIQUE,
+      status TEXT NOT NULL DEFAULT 'pending',
+      send_attempt INTEGER NOT NULL DEFAULT 0,
+      last_attempt_at DATETIME,
+      resolved_at DATETIME,
+      bounce_code TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+
+  console.log("[Migration] Ensuring retry_queue table...");
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS retry_queue (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      email TEXT NOT NULL,
+      user_id INTEGER REFERENCES users(id),
+      attempts INTEGER NOT NULL DEFAULT 0,
+      next_retry_at DATETIME NOT NULL,
+      last_result TEXT,
+      resolved INTEGER NOT NULL DEFAULT 0,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(email, user_id)
+    );
+  `);
+
+  console.log("[Migration] ✓ All migrations complete.");
   await db.close();
 }
 
