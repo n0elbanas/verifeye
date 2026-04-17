@@ -260,6 +260,8 @@ function detectProviderFromMx(mxExchanges: string[]): string | null {
   return null;
 }
 
+const SMTP_BLOCKING_PROVIDERS = new Set(["yahoo", "microsoft", "icloud", "protonmail"]);
+
 /**
  * Providers that block or lie during SMTP probing.
  * These are NEVER probed — heuristic scoring only.
@@ -271,7 +273,6 @@ function detectProviderFromMx(mxExchanges: string[]): string | null {
  *  - iCloud:    Drops connections at firewall level
  *  - ProtonMail:Blocks all external SMTP probes (privacy policy)
  */
-const SMTP_BLOCKING_PROVIDERS = new Set(["google", "yahoo", "microsoft", "icloud", "protonmail"]);
 
 function isEducationalDomain(domain: string): boolean {
   const d = domain.toLowerCase();
@@ -643,6 +644,33 @@ async function verifySingleEmail(email: string): Promise<EmailVerificationResult
 
   const isEducational = isEducationalDomain(domain);
   const isBusinessDomain = base.providerType === "business";
+  const isSmtpBlocking = SMTP_BLOCKING_PROVIDERS.has(mxProvider ?? "");
+
+  // ─── Layer 4: Provider short-circuit (Yahoo/MS etc.) ──────────────
+  // These providers lie or block during SMTP probing — never probe them.
+  // We mark them as Unknown (score < 49) so the user can use Deep Verify.
+  if (isSmtpBlocking) {
+    base.details.smtpSkipped = true;
+    base.details.smtpVerdict = "skipped_blocking_provider";
+
+    // Set score to 45 (Unknown) so it defaults to UI button for deep verification
+    const score = 45;
+    base.confidenceScore = score;
+    base.status = scoreToStatus(score);
+
+    const providerName = mxProvider
+      ? ({ yahoo: "Yahoo Mail", microsoft: "Outlook/Microsoft 365", icloud: "iCloud Mail", protonmail: "ProtonMail" }[mxProvider] ?? mxProvider)
+      : domain;
+
+    base.reason = [
+      `${providerName} actively prevents external verification to protect user privacy.`,
+      `Verification must be done via Deep Verify. Confidence: ${score}/100.`,
+      isRoleBased ? `Role-based address (${prefix}@).` : "",
+      typoSuggestion ? `Possible typo detected — did you mean "${typoSuggestion}"?` : "",
+    ].filter(Boolean).join(" ");
+
+    return base;
+  }
 
   // ─── Layer 5: SMTP probe (all domains) ───────────
   const primaryMx = [...mxRecords].sort((a, b) => a.priority - b.priority)[0].exchange;
