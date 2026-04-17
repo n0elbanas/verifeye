@@ -384,16 +384,16 @@ function randomEhlo(): string {
   return EHLO_NAMES[Math.floor(Math.random() * EHLO_NAMES.length)];
 }
 
-// Jitter delay between commands (50–250ms) — mimics human MTA behaviour
-function jitter(minMs = 50, maxMs = 250): Promise<void> {
-  return new Promise((r) => setTimeout(r, minMs + Math.random() * (maxMs - minMs)));
+// Jitter delay removed to drastically increase verification speed
+function jitter(): Promise<void> {
+  return Promise.resolve();
 }
 
 function smtpProbe(
   mxHost: string,
   email: string,
   port: number,
-  timeoutMs = 6000,
+  timeoutMs = 2500,
 ): Promise<SmtpResult> {
   return new Promise((resolve) => {
     let resolved = false;
@@ -494,22 +494,22 @@ function smtpProbe(
 }
 
 async function smtpCheck(mxHost: string, email: string): Promise<SmtpResult> {
-  const port25 = await smtpProbe(mxHost, email, 25, 6000);
-  console.log(`[VerifEye] Port 25 verdict: ${port25.verdict}`);
+  // Check ports in parallel for maximum speed
+  const [port25, port587] = await Promise.all([
+    smtpProbe(mxHost, email, 25, 2500),
+    smtpProbe(mxHost, email, 587, 2500)
+  ]);
+
+  console.log(`[VerifEye] Port 25 verdict: ${port25.verdict} | Port 587 verdict: ${port587.verdict}`);
 
   if (port25.verdict !== "blocked" && port25.verdict !== "timeout") {
     return port25;
   }
-
-  console.log(`[VerifEye] Port 25 unavailable, trying 587...`);
-  const port587 = await smtpProbe(mxHost, email, 587, 6000);
-  console.log(`[VerifEye] Port 587 verdict: ${port587.verdict}`);
-
-  if (port587.verdict === "blocked" || port587.verdict === "timeout") {
-    return { verdict: "blocked", message: "Ports 25 and 587 both unreachable", catchAll: false };
+  if (port587.verdict !== "blocked" && port587.verdict !== "timeout") {
+    return port587;
   }
 
-  return port587;
+  return { verdict: "blocked", message: "Ports 25 and 587 both unreachable", catchAll: false };
 }
 
 // ---------------------------------------------------------------------------

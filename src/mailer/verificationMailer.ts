@@ -164,7 +164,7 @@ export async function sendDeepVerification(
       console.error(`[DeepVerify] Failed to send to ${email}:`, err.message);
 
       // Classify bounce type from SMTP error codes
-      let bounceCode = "unknown";
+      let bounceCode: string;
       const msg = (err.message ?? "").toLowerCase();
       if (msg.includes("550") || msg.includes("5.1.1") || msg.includes("no such user")) {
         bounceCode = "hard_bounce";
@@ -174,10 +174,13 @@ export async function sendDeepVerification(
         bounceCode = "soft_bounce_greylisted";
       } else if (msg.includes("timeout") || msg.includes("etimedout")) {
         bounceCode = "timeout";
+      } else {
+        // Expose the actual error (truncated) for exact debugging of auth/network failures
+        bounceCode = (err.message || "unknown error").substring(0, 100);
       }
 
       await db.run(
-        `UPDATE verification_queue SET status = 'bounced', bounce_code = ?, resolved_at = CURRENT_TIMESTAMP WHERE id = ?`,
+        `UPDATE verification_queue SET status = 'failed', bounce_code = ?, resolved_at = CURRENT_TIMESTAMP WHERE id = ?`,
         [bounceCode, id]
       );
     }
