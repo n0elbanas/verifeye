@@ -1035,7 +1035,7 @@ app.post("/api/verify/deep", rateLimit, requireAuth, async (req: AuthRequest, re
     const { email, logId } = req.body;
     if (!email || typeof email !== "string") return res.status(400).json({ error: "email is required" });
     if (!MAILER_ENABLED) {
-      return res.status(503).json({
+      return res.json({
         error: "Deep verification is not configured. Add SMTP credentials to .env to enable this feature.",
         disabled: true,
       });

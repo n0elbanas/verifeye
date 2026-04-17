@@ -7,3 +7,5 @@ coverage/
 .env*
 !.env.example
 database.sqlite
+database.sqlite-wal
+database.sqlite-shm
