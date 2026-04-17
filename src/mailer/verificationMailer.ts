@@ -74,13 +74,22 @@ export async function getDeepVerificationStatus(id: number) {
   );
 }
 
-export async function markPixelDelivered(token: string): Promise<boolean> {
+export async function markPixelDelivered(token: string, userAgent?: string): Promise<boolean> {
   const db = await getDb();
   const row = await db.get(
-    `SELECT id FROM verification_queue WHERE tracking_token = ? AND status = 'sent'`,
+    `SELECT id, last_attempt_at FROM verification_queue WHERE tracking_token = ? AND status = 'sent'`,
     [token]
   );
   if (!row) return false;
+
+  // Bot checker: Anti-spam scanners (like Yahoo) and Apple Mail proxy automatically fetch images instantly upon delivery to scan them.
+  // We ignore pixel hits that happen within 20 seconds of sending to eliminate false positives.
+  // Note: SQLite CURRENT_TIMESTAMP is UTC format 'YYYY-MM-DD HH:MM:SS'. We convert it to strict ISO 8601 'YYYY-MM-DDTHH:MM:SSZ' so JS parses it explicitly as UTC.
+  const timeSinceSentMs = Date.now() - new Date(row.last_attempt_at.replace(" ", "T") + "Z").getTime();
+  if (timeSinceSentMs < 20000) {
+    console.warn(`[DeepVerify] Anti-spam bot scan detected. Ignored false-positive pixel limit: ${timeSinceSentMs}ms`);
+    return false;
+  }
 
   await db.run(
     `UPDATE verification_queue SET status = 'delivered', resolved_at = CURRENT_TIMESTAMP WHERE id = ?`,
