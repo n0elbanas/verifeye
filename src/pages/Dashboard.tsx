@@ -53,7 +53,7 @@ interface EmailVerificationResult {
   logId?: number;
 }
 
-type DeepVerifyStatus = "idle" | "loading" | "sent" | "delivered" | "bounced" | "failed" | "pending" | "sending" | "disabled" | "timeout";
+type DeepVerifyStatus = "idle" | "loading" | "sent" | "delivered" | "bounced" | "failed" | "pending" | "sending" | "disabled" | "timeout" | "api_valid" | "api_invalid" | "api_inconclusive";
 
 interface DeepVerifyState {
   status: DeepVerifyStatus;
@@ -264,6 +264,15 @@ function DeepVerifyPanel({
         setState({ status: "disabled", queueId: null, message: "SMTP not configured" });
         return;
       }
+      // Immediate result (Yahoo via Abstract API or web probe — no email sent)
+      if (data.immediate) {
+        const status: DeepVerifyStatus =
+          data.status === "Valid" ? "api_valid" :
+          data.status === "Invalid" ? "api_invalid" :
+          "api_inconclusive";
+        setState({ status, queueId: null, message: data.message ?? "" });
+        return;
+      }
       setState({ status: "pending", queueId: data.queueId, message: "Email sent — waiting for delivery confirmation..." });
       // Start polling
       setTimeout(() => poll(data.queueId), 5000);
@@ -274,26 +283,32 @@ function DeepVerifyPanel({
   };
 
   const statusIcons: Partial<Record<DeepVerifyStatus, React.ReactNode>> = {
-    loading: <Loader2 className="w-4 h-4 animate-spin" />,
-    pending: <RefreshCw className="w-4 h-4 animate-spin text-blue-500" />,
-    sending: <RefreshCw className="w-4 h-4 animate-spin text-blue-500" />,
-    sent:      <Send className="w-4 h-4 text-blue-500" />,
-    delivered: <CheckCircle2 className="w-4 h-4 text-emerald-500" />,
-    bounced:   <XCircle className="w-4 h-4 text-red-500" />,
-    failed:    <AlertCircle className="w-4 h-4 text-red-400" />,
-    disabled:  <AlertCircle className="w-4 h-4 text-zinc-400" />,
-    timeout:   <AlertCircle className="w-4 h-4 text-amber-500" />,
+    loading:          <Loader2 className="w-4 h-4 animate-spin" />,
+    pending:          <RefreshCw className="w-4 h-4 animate-spin text-blue-500" />,
+    sending:          <RefreshCw className="w-4 h-4 animate-spin text-blue-500" />,
+    sent:             <Send className="w-4 h-4 text-blue-500" />,
+    delivered:        <CheckCircle2 className="w-4 h-4 text-emerald-500" />,
+    bounced:          <XCircle className="w-4 h-4 text-red-500" />,
+    failed:           <AlertCircle className="w-4 h-4 text-red-400" />,
+    disabled:         <AlertCircle className="w-4 h-4 text-zinc-400" />,
+    timeout:          <AlertCircle className="w-4 h-4 text-amber-500" />,
+    api_valid:        <CheckCircle2 className="w-4 h-4 text-emerald-500" />,
+    api_invalid:      <XCircle className="w-4 h-4 text-red-500" />,
+    api_inconclusive: <AlertCircle className="w-4 h-4 text-amber-500" />,
   };
 
   const statusLabels: Partial<Record<DeepVerifyStatus, string>> = {
-    pending:  "Email sent — awaiting open/delivery...",
-    sending:  "Sending probe email...",
-    sent:     "Delivered to provider. Awaiting open...",
-    delivered:"✓ Email opened — address is active!",
-    bounced:  `Bounced — ${state.message || "address likely invalid"}`,
-    failed:   state.message || "Deep verification failed",
-    disabled: "Deep verification requires SMTP credentials in .env",
-    timeout:  "Delivered but unopened. Likely inactive or invalid.",
+    pending:          "Email sent — awaiting open/delivery...",
+    sending:          "Sending probe email...",
+    sent:             "Delivered to provider. Awaiting open...",
+    delivered:        "✓ Email opened — address is active!",
+    bounced:          `Bounced — ${state.message || "address likely invalid"}`,
+    failed:           state.message || "Deep verification failed",
+    disabled:         "Deep verification requires SMTP credentials in .env",
+    timeout:          "Delivered but unopened. Likely inactive or invalid.",
+    api_valid:        `✓ Valid — ${state.message}`,
+    api_invalid:      `✗ Invalid — ${state.message}`,
+    api_inconclusive: state.message || "Could not verify automatically.",
   };
 
   return (

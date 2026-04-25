@@ -1237,10 +1237,74 @@ app.post("/api/verify-bulk", rateLimit, requireAuth, async (req: AuthRequest, re
 });
 
 // ── Deep (real-email) verification ────────────────────────────────────────────
+// Yahoo domains detected by MX or known domain list
+const YAHOO_FAMILY_DOMAINS = new Set([
+  "yahoo.com", "yahoo.co.uk", "yahoo.fr", "yahoo.de", "yahoo.es",
+  "yahoo.in", "yahoo.com.au", "yahoo.com.br", "yahoo.com.ar", "yahoo.co.jp",
+  "ymail.com", "rocketmail.com", "aol.com",
+]);
+
 app.post("/api/verify/deep", rateLimit, requireAuth, async (req: AuthRequest, res: Response) => {
   try {
     const { email, logId } = req.body;
     if (!email || typeof email !== "string") return res.status(400).json({ error: "email is required" });
+
+    const normalizedEmail = email.trim();
+    const domain = normalizedEmail.split("@")[1]?.toLowerCase() ?? "";
+    const numericLogId = parseInt(logId ?? "0");
+    const isYahoo = YAHOO_FAMILY_DOMAINS.has(domain);
+
+    // ── Yahoo: Abstract API → web probe → inform user (SMTP sending is blocked by Yahoo) ──
+    if (isYahoo) {
+      // 1. Try Abstract API (most reliable — uses trusted IP infrastructure)
+      const apiResult = await verifyViaAbstractAPI(normalizedEmail);
+      if (apiResult.valid !== null) {
+        const db = await getDb();
+        const newStatus = apiResult.valid ? "Valid" : "Invalid";
+        const newScore = apiResult.valid ? 80 : 0;
+        if (numericLogId) {
+          await db.run("UPDATE logs SET status = ?, confidence_score = ? WHERE id = ?", [newStatus, newScore, numericLogId]);
+        }
+        return res.json({
+          success: true,
+          immediate: true,
+          method: "abstract_api",
+          status: newStatus,
+          message: apiResult.reason,
+        });
+      }
+
+      // 2. Try Yahoo login-challenge web probe
+      const webResult = await verifyYahooViaWebProbe(normalizedEmail);
+      if (webResult.valid !== null) {
+        const db = await getDb();
+        const newStatus = webResult.valid ? "Valid" : "Invalid";
+        const newScore = webResult.valid ? 75 : 0;
+        if (numericLogId) {
+          await db.run("UPDATE logs SET status = ?, confidence_score = ? WHERE id = ?", [newStatus, newScore, numericLogId]);
+        }
+        return res.json({
+          success: true,
+          immediate: true,
+          method: "yahoo_web_probe",
+          status: newStatus,
+          message: webResult.reason,
+        });
+      }
+
+      // 3. Both inconclusive — inform user, do NOT send email (Yahoo blocks it)
+      return res.json({
+        success: false,
+        immediate: true,
+        method: "none",
+        status: "Unknown",
+        message: process.env.ABSTRACT_API_KEY
+          ? `Yahoo could not be verified automatically: ${webResult.reason}`
+          : "Add ABSTRACT_API_KEY to .env to enable reliable Yahoo verification. Yahoo blocks verification emails from third-party SMTP servers.",
+      });
+    }
+
+    // ── Non-Yahoo: standard SMTP email send (works for MS/iCloud/ProtonMail) ──
     if (!MAILER_ENABLED) {
       return res.json({
         error: "Deep verification is not configured. Add SMTP credentials to .env to enable this feature.",
@@ -1248,8 +1312,7 @@ app.post("/api/verify/deep", rateLimit, requireAuth, async (req: AuthRequest, re
       });
     }
 
-    const numericLogId = parseInt(logId ?? "0");
-    const result = await sendDeepVerification(email.trim(), numericLogId);
+    const result = await sendDeepVerification(normalizedEmail, numericLogId);
     return res.json({ success: true, queueId: result.queueId, message: "Verification email queued successfully." });
   } catch (error: any) {
     console.error("[VerifEye] /api/verify/deep error:", error);
