@@ -601,6 +601,80 @@ export interface EmailVerificationResult {
 }
 
 // ---------------------------------------------------------------------------
+// Yahoo account-challenge web probe
+// ---------------------------------------------------------------------------
+// Yahoo blocks raw SMTP probing AND rejects Deep Verify emails from low-
+// reputation senders (e.g. personal Gmail). The only reliable self-hosted
+// method is to simulate Yahoo's own login-flow username challenge, which
+// returns different responses for existing vs non-existing accounts.
+// ---------------------------------------------------------------------------
+const YAHOO_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
+async function verifyYahooViaWebProbe(email: string): Promise<{ valid: boolean | null; reason: string }> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 12000);
+  try {
+    // Step 1: Init session — get cookies + embedded session token
+    const initRes = await fetch("https://login.yahoo.com/", {
+      headers: { "User-Agent": YAHOO_UA, "Accept-Language": "en-US,en;q=0.9", "Accept": "text/html,*/*" },
+      signal: ctrl.signal,
+      redirect: "follow",
+    });
+    const rawCookies: string[] = (initRes.headers as any).getSetCookie
+      ? (initRes.headers as any).getSetCookie()
+      : (initRes.headers.get("set-cookie") ?? "").split(/,(?=\s*\w+=)/);
+    const cookieStr = rawCookies.map((c: string) => c.split(";")[0]).join("; ");
+    const html = await initRes.text();
+
+    // Yahoo embeds a sessionKey in the page source used by their JS auth flow
+    const skMatch = html.match(/["']sessionKey["']\s*:\s*["']([^"']+)["']/);
+    if (!skMatch) {
+      clearTimeout(timer);
+      return { valid: null, reason: "Yahoo session init failed — page structure changed or bot-detected" };
+    }
+
+    // Step 2: POST email to Yahoo's username-challenge endpoint
+    const body = new URLSearchParams({ username: email, sessionKey: skMatch[1] });
+    const challengeRes = await fetch("https://login.yahoo.com/account/challenge/username", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Cookie": cookieStr,
+        "Referer": "https://login.yahoo.com/",
+        "User-Agent": YAHOO_UA,
+        "X-Requested-With": "XMLHttpRequest",
+      },
+      body: body.toString(),
+      signal: ctrl.signal,
+    });
+    clearTimeout(timer);
+    const responseText = await challengeRes.text();
+    console.log(`[VerifEye] Yahoo web probe status=${challengeRes.status} body=${responseText.substring(0, 120)}`);
+
+    const notFound = responseText.includes("USER_NOT_FOUND") || responseText.includes("INVALID_USERNAME") || challengeRes.status === 404;
+    if (notFound) return { valid: false, reason: "Yahoo account does not exist (login challenge rejected)" };
+    if (challengeRes.status === 200) return { valid: true, reason: "Yahoo account exists (login challenge accepted)" };
+    return { valid: null, reason: `Yahoo web probe inconclusive (HTTP ${challengeRes.status})` };
+  } catch (err: any) {
+    clearTimeout(timer);
+    return { valid: null, reason: err?.name === "AbortError" ? "Yahoo web probe timed out" : `Yahoo web probe error: ${err?.message}` };
+  }
+}
+
+// Optional: AbstractAPI fallback (set ABSTRACT_API_KEY in .env for reliable Yahoo/edu verification)
+async function verifyViaAbstractAPI(email: string): Promise<{ valid: boolean | null; reason: string }> {
+  const key = process.env.ABSTRACT_API_KEY;
+  if (!key) return { valid: null, reason: "No ABSTRACT_API_KEY configured" };
+  try {
+    const res = await fetch(`https://emailvalidation.abstractapi.com/v1/?api_key=${key}&email=${encodeURIComponent(email)}`);
+    const data = await res.json() as any;
+    if (data.deliverability === "DELIVERABLE") return { valid: true, reason: `Deliverable (Abstract API, score: ${data.quality_score})` };
+    if (data.deliverability === "UNDELIVERABLE") return { valid: false, reason: "Undeliverable (Abstract API confirmed)" };
+    return { valid: null, reason: `Abstract API: ${data.deliverability}` };
+  } catch { return { valid: null, reason: "Abstract API request failed" }; }
+}
+
+// ---------------------------------------------------------------------------
 // Core verification engine
 // ---------------------------------------------------------------------------
 async function verifySingleEmail(email: string): Promise<EmailVerificationResult> {
@@ -707,36 +781,82 @@ async function verifySingleEmail(email: string): Promise<EmailVerificationResult
   const isBusinessDomain = base.providerType === "business";
   const isSmtpBlocking = SMTP_BLOCKING_PROVIDERS.has(mxProvider ?? "");
 
-  // ─── Layer 4: Blocking providers (Yahoo / Outlook / iCloud / ProtonMail) ──────
-  // Yahoo: MX servers return 250 OK for EVERY address at the infrastructure
-  // level — this is a permanent privacy policy, not a short-lived cache.
-  // Raw SMTP probing (including double-send) cannot determine mailbox existence.
-  // Microsoft, iCloud, ProtonMail: firewall or policy blocks all external probes.
-  // All four providers require Deep Verify for a definitive result.
+  // ─── Layer 4: Blocking providers ─────────────────────────────────────────
   if (isSmtpBlocking) {
     base.details.smtpSkipped = true;
     base.details.smtpVerdict = "skipped_blocking_provider";
 
+    // ── Yahoo: try web-challenge probe + optional Abstract API ──────────────
+    // Raw SMTP and Deep Verify (email send) both fail for Yahoo from
+    // low-reputation senders. Use Yahoo's own login-challenge API instead.
+    if (mxProvider === "yahoo") {
+      // 1. Try Abstract API first if configured (most reliable)
+      const apiResult = await verifyViaAbstractAPI(email);
+      if (apiResult.valid !== null) {
+        if (apiResult.valid) {
+          const score = calculateConfidenceScore({ syntaxValid: true, mxFound: true, smtpAccepted: true, catchAll: false, roleBased: isRoleBased, disposable: false, freeProvider: true, educationalDomain: false, businessDomain: false, typoDomain: !!typoSuggestion, smtpBlocking: false, greylisted: false, policyBlock: false });
+          base.confidenceScore = score;
+          base.status = isRoleBased ? "Risky" : scoreToStatus(score);
+          base.details.smtpVerdict = "api_confirmed_valid";
+          base.flags.push("api_verified");
+          base.reason = `${apiResult.reason}. Confidence: ${score}/100.`;
+          return base;
+        } else {
+          base.status = "Invalid";
+          base.confidenceScore = 0;
+          base.details.smtpVerdict = "api_confirmed_invalid";
+          base.reason = apiResult.reason;
+          return base;
+        }
+      }
+
+      // 2. Try Yahoo login-challenge web probe
+      const webResult = await verifyYahooViaWebProbe(email);
+      if (webResult.valid === true) {
+        const score = calculateConfidenceScore({ syntaxValid: true, mxFound: true, smtpAccepted: true, catchAll: false, roleBased: isRoleBased, disposable: false, freeProvider: true, educationalDomain: false, businessDomain: false, typoDomain: !!typoSuggestion, smtpBlocking: false, greylisted: false, policyBlock: false });
+        base.confidenceScore = score;
+        base.status = isRoleBased ? "Risky" : scoreToStatus(score);
+        base.details.smtpVerdict = "yahoo_web_probe_valid";
+        base.flags.push("yahoo_web_confirmed");
+        base.reason = `${webResult.reason}. Confidence: ${score}/100.`;
+        return base;
+      }
+      if (webResult.valid === false) {
+        base.status = "Invalid";
+        base.confidenceScore = 0;
+        base.details.smtpVerdict = "yahoo_web_probe_invalid";
+        base.flags.push("yahoo_web_rejected");
+        base.reason = webResult.reason;
+        return base;
+      }
+
+      // 3. Both inconclusive — Unknown, prompt user
+      const score = 45;
+      base.confidenceScore = score;
+      base.status = scoreToStatus(score);
+      base.details.smtpVerdict = "yahoo_unverifiable";
+      base.reason = [
+        `Yahoo Mail cannot be verified automatically (${webResult.reason}).`,
+        process.env.ABSTRACT_API_KEY ? "" : "Add ABSTRACT_API_KEY to .env for reliable Yahoo verification.",
+        isRoleBased ? `Role-based address (${prefix}@).` : "",
+        typoSuggestion ? `Possible typo — did you mean "${typoSuggestion}"?` : "",
+      ].filter(Boolean).join(" ");
+      return base;
+    }
+
+    // ── Microsoft / iCloud / ProtonMail ────────────────────────────────────
     const score = 45;
     base.confidenceScore = score;
     base.status = scoreToStatus(score);
-
     const providerName = mxProvider
-      ? ({
-          yahoo: "Yahoo Mail",
-          microsoft: "Outlook/Microsoft 365",
-          icloud: "iCloud Mail",
-          protonmail: "ProtonMail",
-        }[mxProvider] ?? mxProvider)
+      ? ({ microsoft: "Outlook/Microsoft 365", icloud: "iCloud Mail", protonmail: "ProtonMail" }[mxProvider] ?? mxProvider)
       : domain;
-
     base.reason = [
-      `${providerName} accepts all SMTP probes regardless of mailbox existence — external verification is not possible.`,
+      `${providerName} actively prevents external verification to protect user privacy.`,
       `Use Deep Verify for a definitive result. Confidence: ${score}/100.`,
       isRoleBased ? `Role-based address (${prefix}@).` : "",
       typoSuggestion ? `Possible typo detected — did you mean "${typoSuggestion}"?` : "",
     ].filter(Boolean).join(" ");
-
     return base;
   }
 
