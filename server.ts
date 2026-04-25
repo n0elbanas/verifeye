@@ -260,11 +260,8 @@ function detectProviderFromMx(mxExchanges: string[]): string | null {
   return null;
 }
 
-const SMTP_BLOCKING_PROVIDERS = new Set(["microsoft", "icloud", "protonmail"]);
+const SMTP_BLOCKING_PROVIDERS = new Set(["yahoo", "microsoft", "icloud", "protonmail"]);
 
-// Yahoo-family providers accept ALL RCPT TO on probe 1 (anti-enumeration).
-// A second probe ~600ms later reveals real rejections — handled by doubleSmtpProbe().
-const DOUBLE_PROBE_PROVIDERS = new Set(["yahoo"]);
 
 /**
  * Providers that block or lie during SMTP probing.
@@ -709,67 +706,13 @@ async function verifySingleEmail(email: string): Promise<EmailVerificationResult
   const isEducational = isEducationalDomain(domain);
   const isBusinessDomain = base.providerType === "business";
   const isSmtpBlocking = SMTP_BLOCKING_PROVIDERS.has(mxProvider ?? "");
-  const isDoubleProbeCandidate = DOUBLE_PROBE_PROVIDERS.has(mxProvider ?? "");
 
-  // ─── Layer 4a: Yahoo double-send SMTP bounce probe ───────────────────────
-  // Yahoo accepts ALL RCPT TO on probe 1 (anti-enumeration). Probe 2 sent
-  // ~600ms later reveals the truth once the cache expires.
-  if (isDoubleProbeCandidate) {
-    const primaryMxForProbe = [...mxRecords].sort((a, b) => a.priority - b.priority)[0].exchange;
-
-    if (canSmtpProbe(domain)) {
-      const dpr = await doubleSmtpProbe(email, primaryMxForProbe);
-
-      if (dpr.verdict === "valid") {
-        const score = calculateConfidenceScore({
-          syntaxValid: true, mxFound: true, smtpAccepted: true,
-          catchAll: false, roleBased: isRoleBased, disposable: false,
-          freeProvider: isFreeProvider, educationalDomain: isEducational,
-          businessDomain: isBusinessDomain, typoDomain: !!typoSuggestion,
-          smtpBlocking: false, greylisted: false, policyBlock: false,
-        });
-        base.confidenceScore = score;
-        base.status = isRoleBased ? "Risky" : scoreToStatus(score);
-        base.details.smtp = true;
-        base.details.smtpVerdict = "double_probe_valid";
-        base.flags.push("double_probe_confirmed");
-        base.reason = [
-          isRoleBased
-            ? `Role-based address (${prefix}@) — mailbox confirmed by double-send SMTP probe. Confidence: ${score}/100.`
-            : `Mailbox confirmed by double-send SMTP probe. Confidence: ${score}/100.`,
-          typoSuggestion ? `Possible typo — did you mean "${typoSuggestion}"?` : "",
-        ].filter(Boolean).join(" ");
-        return base;
-      }
-
-      if (dpr.verdict === "invalid") {
-        base.status = "Invalid";
-        base.confidenceScore = 0;
-        base.details.smtpVerdict = "double_probe_invalid";
-        base.flags.push("double_probe_rejected");
-        base.reason = `Mailbox does not exist (double-send probe confirmed): ${dpr.reason}`;
-        return base;
-      }
-    }
-
-    // Double-probe inconclusive or domain rate-limited — fall back to Unknown
-    base.details.smtpSkipped = true;
-    base.details.smtpVerdict = "double_probe_inconclusive";
-    const score = 45;
-    base.confidenceScore = score;
-    base.status = scoreToStatus(score);
-    base.reason = [
-      `Yahoo Mail — double-send probe inconclusive, cannot confirm mailbox. Confidence: ${score}/100.`,
-      "Use Deep Verify for a definitive result.",
-      isRoleBased ? `Role-based address (${prefix}@).` : "",
-      typoSuggestion ? `Possible typo — did you mean "${typoSuggestion}"?` : "",
-    ].filter(Boolean).join(" ");
-    return base;
-  }
-
-  // ─── Layer 4b: Full SMTP-blocking providers (Outlook / iCloud / ProtonMail) ─
-  // These block ALL external probes via firewall or policy — double-probe
-  // cannot help. Deep Verify is the only viable path.
+  // ─── Layer 4: Blocking providers (Yahoo / Outlook / iCloud / ProtonMail) ──────
+  // Yahoo: MX servers return 250 OK for EVERY address at the infrastructure
+  // level — this is a permanent privacy policy, not a short-lived cache.
+  // Raw SMTP probing (including double-send) cannot determine mailbox existence.
+  // Microsoft, iCloud, ProtonMail: firewall or policy blocks all external probes.
+  // All four providers require Deep Verify for a definitive result.
   if (isSmtpBlocking) {
     base.details.smtpSkipped = true;
     base.details.smtpVerdict = "skipped_blocking_provider";
@@ -779,12 +722,17 @@ async function verifySingleEmail(email: string): Promise<EmailVerificationResult
     base.status = scoreToStatus(score);
 
     const providerName = mxProvider
-      ? ({ microsoft: "Outlook/Microsoft 365", icloud: "iCloud Mail", protonmail: "ProtonMail" }[mxProvider] ?? mxProvider)
+      ? ({
+          yahoo: "Yahoo Mail",
+          microsoft: "Outlook/Microsoft 365",
+          icloud: "iCloud Mail",
+          protonmail: "ProtonMail",
+        }[mxProvider] ?? mxProvider)
       : domain;
 
     base.reason = [
-      `${providerName} actively prevents external verification to protect user privacy.`,
-      `Verification must be done via Deep Verify. Confidence: ${score}/100.`,
+      `${providerName} accepts all SMTP probes regardless of mailbox existence — external verification is not possible.`,
+      `Use Deep Verify for a definitive result. Confidence: ${score}/100.`,
       isRoleBased ? `Role-based address (${prefix}@).` : "",
       typoSuggestion ? `Possible typo detected — did you mean "${typoSuggestion}"?` : "",
     ].filter(Boolean).join(" ");
@@ -810,9 +758,10 @@ async function verifySingleEmail(email: string): Promise<EmailVerificationResult
   if (smtp.verdict === "catch_all") base.flags.push("catch_all");
 
   // ─── Layer 5a: Educational domain catch-all double-probe ─────────────────
-  // If a .edu / .ac.xx server returns catch-all on the standard probe, run
-  // the double-send probe to attempt definitive mailbox confirmation.
-  if (smtp.verdict === "catch_all" && isEducational) {
+  // If a .edu / .ac.xx server is a catch-all, run the double-probe to attempt
+  // definitive mailbox confirmation. Skipped if the edu domain routes through
+  // Yahoo MX (Yahoo accepts everything — probe result would be meaningless).
+  if (smtp.verdict === "catch_all" && isEducational && mxProvider !== "yahoo") {
     const dpr = await doubleSmtpProbe(email, primaryMx);
     if (dpr.verdict === "valid") {
       smtp = { verdict: "accepted", message: "Double-probe confirmed (was catch-all)", catchAll: false };
