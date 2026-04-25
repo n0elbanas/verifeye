@@ -731,7 +731,7 @@ async function verifySingleEmail(email: string): Promise<EmailVerificationResult
         base.reason = [
           isRoleBased
             ? `Role-based address (${prefix}@) — mailbox confirmed by double-send SMTP probe. Confidence: ${score}/100.`
-            : `Mailbox confirmed by double-send SMTP probe (Verifalia method). Confidence: ${score}/100.`,
+            : `Mailbox confirmed by double-send SMTP probe. Confidence: ${score}/100.`,
           typoSuggestion ? `Possible typo — did you mean "${typoSuggestion}"?` : "",
         ].filter(Boolean).join(" ");
         return base;
