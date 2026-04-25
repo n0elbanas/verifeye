@@ -554,14 +554,19 @@ async function doubleSmtpProbe(email: string, mxHost: string): Promise<DoublePro
     return { verdict: "inconclusive", reason: `Probe 1 inconclusive (${p1.verdict}): ${p1.message}`, probe1: p1.verdict, probe2: null };
   }
 
-  // Wait for anti-enumeration cache to expire
-  await new Promise(r => setTimeout(r, 600));
+  // Wait for anti-enumeration cache to expire — 1500ms is more reliable than 600ms
+  await new Promise(r => setTimeout(r, 1500));
 
   const p2 = await smtpCheck(mxHost, email);
   console.log(`[VerifEye] Double-probe P2: ${p2.verdict} — ${p2.message}`);
 
-  if (p2.verdict === "accepted" || p2.verdict === "catch_all") {
-    return { verdict: "valid", reason: "Both SMTP probes accepted the recipient (double-probe confirmed).", probe1: p1.verdict, probe2: p2.verdict };
+  // Only "accepted" (random address was rejected, real address kept) is a confirmed valid mailbox.
+  // "catch_all" means the server STILL accepts fake addresses too — cannot confirm existence.
+  if (p2.verdict === "accepted") {
+    return { verdict: "valid", reason: "Double-send SMTP probe confirmed the recipient (random address rejected).", probe1: p1.verdict, probe2: p2.verdict };
+  }
+  if (p2.verdict === "catch_all") {
+    return { verdict: "inconclusive", reason: "Server is a true catch-all — accepts all addresses including fakes. Cannot confirm mailbox existence.", probe1: p1.verdict, probe2: p2.verdict };
   }
   if (p2.verdict === "invalid_mailbox") {
     return { verdict: "invalid", reason: `Mailbox rejected on second probe (cache expired): ${p2.message}`, probe1: p1.verdict, probe2: p2.verdict };
