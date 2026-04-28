@@ -661,17 +661,52 @@ async function verifyYahooViaWebProbe(email: string): Promise<{ valid: boolean |
   }
 }
 
-// Optional: AbstractAPI fallback (set ABSTRACT_API_KEY in .env for reliable Yahoo/edu verification)
-async function verifyViaAbstractAPI(email: string): Promise<{ valid: boolean | null; reason: string }> {
+// Optional: Abstract API fallback (set ABSTRACT_API_KEY in .env for reliable Yahoo/edu verification)
+// When deliverability is "UNKNOWN" (Yahoo/iCloud block Abstract API SMTP probes too),
+// quality_score is used as a soft tiebreaker:
+//   >= 0.80 + MX found  → treat as deliverable
+//   <= 0.30             → treat as undeliverable
+//   in between          → still inconclusive
+async function verifyViaAbstractAPI(email: string): Promise<{ valid: boolean | null; reason: string; qualityScore?: number }> {
   const key = process.env.ABSTRACT_API_KEY;
   if (!key) return { valid: null, reason: "No ABSTRACT_API_KEY configured" };
   try {
-    const res = await fetch(`https://emailvalidation.abstractapi.com/v1/?api_key=${key}&email=${encodeURIComponent(email)}`);
+    const res = await fetch(
+      `https://emailvalidation.abstractapi.com/v1/?api_key=${key}&email=${encodeURIComponent(email)}`
+    );
     const data = await res.json() as any;
-    if (data.deliverability === "DELIVERABLE") return { valid: true, reason: `Deliverable (Abstract API, score: ${data.quality_score})` };
-    if (data.deliverability === "UNDELIVERABLE") return { valid: false, reason: "Undeliverable (Abstract API confirmed)" };
-    return { valid: null, reason: `Abstract API: ${data.deliverability}` };
-  } catch { return { valid: null, reason: "Abstract API request failed" }; }
+    const qs: number = parseFloat(data.quality_score ?? "0");
+    const mxFound: boolean = data.is_mx_found?.value === true;
+
+    if (data.deliverability === "DELIVERABLE") {
+      return { valid: true, reason: `Deliverable (Abstract API, quality score: ${qs.toFixed(2)})`, qualityScore: qs };
+    }
+    if (data.deliverability === "UNDELIVERABLE") {
+      return { valid: false, reason: `Undeliverable (Abstract API confirmed, quality score: ${qs.toFixed(2)})`, qualityScore: qs };
+    }
+
+    // deliverability === "UNKNOWN" — Yahoo/iCloud block API's SMTP probes too
+    // Use quality_score as a soft signal instead of returning null immediately
+    if (qs >= 0.80 && mxFound) {
+      return {
+        valid: true,
+        reason: `Likely deliverable — valid format and MX, SMTP unverifiable by API (quality score: ${qs.toFixed(2)})`,
+        qualityScore: qs,
+      };
+    }
+    if (qs <= 0.30) {
+      return {
+        valid: false,
+        reason: `Likely undeliverable — very low quality score: ${qs.toFixed(2)}`,
+        qualityScore: qs,
+      };
+    }
+
+    // Genuinely inconclusive
+    return { valid: null, reason: `Abstract API: deliverability unknown (quality score: ${qs.toFixed(2)})`, qualityScore: qs };
+  } catch {
+    return { valid: null, reason: "Abstract API request failed" };
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -830,14 +865,19 @@ async function verifySingleEmail(email: string): Promise<EmailVerificationResult
         return base;
       }
 
-      // 3. Both inconclusive — Unknown, prompt user
-      const score = 45;
+      // 3. Both inconclusive — Yahoo's domain and format are valid but the specific
+      // mailbox cannot be confirmed externally. Return Risky (not Unknown) because
+      // syntax + MX = real Yahoo domain; only the mailbox existence is unconfirmed.
+      const score = 55;
       base.confidenceScore = score;
-      base.status = scoreToStatus(score);
+      base.status = "Risky";
       base.details.smtpVerdict = "yahoo_unverifiable";
       base.reason = [
-        `Yahoo Mail cannot be verified automatically (${webResult.reason}).`,
-        process.env.ABSTRACT_API_KEY ? "" : "Add ABSTRACT_API_KEY to .env for reliable Yahoo verification.",
+        "Yahoo Mail: domain and format are valid, but Yahoo's privacy policy prevents external mailbox verification.",
+        process.env.ABSTRACT_API_KEY
+          ? "Abstract API was inconclusive — Yahoo limits SMTP probing for all third-party services."
+          : "Add ABSTRACT_API_KEY to .env to improve Yahoo verification accuracy.",
+        `Confidence: ${score}/100.`,
         isRoleBased ? `Role-based address (${prefix}@).` : "",
         typoSuggestion ? `Possible typo — did you mean "${typoSuggestion}"?` : "",
       ].filter(Boolean).join(" ");
