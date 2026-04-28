@@ -1007,7 +1007,17 @@ async function verifySingleEmail(email: string): Promise<EmailVerificationResult
 
     case "catch_all":
       base.status = "Risky";
-      base.reason = `Catch-all domain — server accepts all addresses, mailbox existence unverifiable. Confidence: ${score}/100.`;
+      if (isEducational) {
+        // Verifalia-style ServerIsCatchAll message for educational institutions
+        base.reason = [
+          `Catch-all mail exchanger detected — the mail server for ${domain} accepts all addresses,`,
+          `including fake and non-existent ones. The existence of this specific mailbox cannot be verified.`,
+          `This is common for university and institutional mail servers (ServerIsCatchAll).`,
+          `Confidence: ${score}/100.`,
+        ].join(" ");
+      } else {
+        base.reason = `Catch-all domain — server accepts all addresses including non-existent ones. Mailbox existence cannot be verified. Confidence: ${score}/100.`;
+      }
       break;
 
     case "invalid_mailbox":
@@ -1038,7 +1048,8 @@ async function verifySingleEmail(email: string): Promise<EmailVerificationResult
       break;
   }
 
-  if (isEducational) {
+  // For educational non-catch-all results, prepend context label
+  if (isEducational && smtp.verdict !== "catch_all") {
     base.reason = `[Educational institution] ${base.reason}`;
   }
   if (typoSuggestion && smtp.verdict !== "invalid_mailbox") {
