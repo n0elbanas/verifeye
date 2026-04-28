@@ -661,33 +661,49 @@ async function verifyYahooViaWebProbe(email: string): Promise<{ valid: boolean |
   }
 }
 
-// Optional: Abstract API fallback (set ABSTRACT_API_KEY in .env for reliable Yahoo/edu verification)
-// When deliverability is "UNKNOWN" (Yahoo/iCloud block Abstract API SMTP probes too),
-// quality_score is used as a soft tiebreaker:
-//   >= 0.80 + MX found  → treat as deliverable
-//   <= 0.30             → treat as undeliverable
-//   in between          → still inconclusive
+// Optional: Abstract API — Email Reputation API (emailreputation.abstractapi.com/v1)
+// Docs: https://docs.abstractapi.com/api/email-reputation
+// Set ABSTRACT_API_KEY in .env to enable reliable Yahoo / educational domain verification.
+//
+// Response schema (relevant fields):
+//   email_deliverability.status        : "deliverable" | "undeliverable" | "unknown"
+//   email_deliverability.is_mx_valid   : boolean
+//   email_quality.score                : number | null   (0.0 – 1.0)
+//
+// When status === "unknown" (Yahoo blocks their SMTP probes too), quality_score is used
+// as a soft tiebreaker:
+//   >= 0.80 + MX valid  → treat as deliverable
+//   > 0 and <= 0.30     → treat as undeliverable
+//   0.00 / null         → "unable to score" (rate limit / missing field) → inconclusive
 async function verifyViaAbstractAPI(email: string): Promise<{ valid: boolean | null; reason: string; qualityScore?: number }> {
   const key = process.env.ABSTRACT_API_KEY;
   if (!key) return { valid: null, reason: "No ABSTRACT_API_KEY configured" };
   try {
     const res = await fetch(
-      `https://emailvalidation.abstractapi.com/v1/?api_key=${key}&email=${encodeURIComponent(email)}`
+      `https://emailreputation.abstractapi.com/v1/?api_key=${key}&email=${encodeURIComponent(email)}`
     );
+    if (!res.ok) {
+      return { valid: null, reason: `Abstract API HTTP error: ${res.status}` };
+    }
     const data = await res.json() as any;
-    const qs: number = parseFloat(data.quality_score ?? "0");
-    const mxFound: boolean = data.is_mx_found?.value === true;
 
-    if (data.deliverability === "DELIVERABLE") {
+    const status: string = (data.email_deliverability?.status ?? "").toLowerCase();
+    const qs: number = parseFloat(data.email_quality?.score ?? "0") || 0;
+    const mxValid: boolean = data.email_deliverability?.is_mx_valid === true;
+
+    console.log(`[VerifEye] Abstract API → email=${email} status=${status} score=${qs} mxValid=${mxValid}`);
+
+    if (status === "deliverable") {
       return { valid: true, reason: `Deliverable (Abstract API, quality score: ${qs.toFixed(2)})`, qualityScore: qs };
     }
-    if (data.deliverability === "UNDELIVERABLE") {
-      return { valid: false, reason: `Undeliverable (Abstract API confirmed, quality score: ${qs.toFixed(2)})`, qualityScore: qs };
+    if (status === "undeliverable") {
+      const detail = data.email_deliverability?.status_detail ?? "undeliverable";
+      return { valid: false, reason: `Undeliverable — ${detail} (Abstract API, quality score: ${qs.toFixed(2)})`, qualityScore: qs };
     }
 
-    // deliverability === "UNKNOWN" — Yahoo/iCloud block API's SMTP probes too
-    // Use quality_score as a soft signal instead of returning null immediately
-    if (qs >= 0.80 && mxFound) {
+    // status === "unknown" — provider (Yahoo/iCloud) blocks Abstract API's SMTP probes too.
+    // Fall back to quality_score as a soft signal.
+    if (qs >= 0.80 && mxValid) {
       return {
         valid: true,
         reason: `Likely deliverable — valid format and MX, SMTP unverifiable by API (quality score: ${qs.toFixed(2)})`,
@@ -701,12 +717,11 @@ async function verifyViaAbstractAPI(email: string): Promise<{ valid: boolean | n
         qualityScore: qs,
       };
     }
-    // qs === 0.00 means "unable to score" (API rate limit / missing field) — treat as inconclusive
+    // qs === 0 or null → API couldn't score (rate limit / field missing) → inconclusive
 
-    // Genuinely inconclusive
     return { valid: null, reason: `Abstract API: deliverability unknown (quality score: ${qs.toFixed(2)})`, qualityScore: qs };
-  } catch {
-    return { valid: null, reason: "Abstract API request failed" };
+  } catch (err: any) {
+    return { valid: null, reason: `Abstract API request failed: ${err?.message ?? "unknown error"}` };
   }
 }
 
