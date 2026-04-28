@@ -877,10 +877,11 @@ async function verifySingleEmail(email: string): Promise<EmailVerificationResult
 
   if (smtp.verdict === "catch_all") base.flags.push("catch_all");
 
-  // ─── Layer 5a: Educational domain catch-all double-probe ─────────────────
+  // ─── Layer 5a: Educational domain catch-all double-probe + Abstract API fallback ──
   // If a .edu / .ac.xx server is a catch-all, run the double-probe to attempt
   // definitive mailbox confirmation. Skipped if the edu domain routes through
   // Yahoo MX (Yahoo accepts everything — probe result would be meaningless).
+  // If double-probe is also inconclusive, Abstract API is tried as a final tiebreaker.
   if (smtp.verdict === "catch_all" && isEducational && mxProvider !== "yahoo") {
     const dpr = await doubleSmtpProbe(email, primaryMx);
     if (dpr.verdict === "valid") {
@@ -897,8 +898,27 @@ async function verifySingleEmail(email: string): Promise<EmailVerificationResult
       base.details.smtpVerdict = "double_probe_invalid";
       base.flags = base.flags.filter(f => f !== "catch_all");
       base.flags.push("double_probe_rejected");
+    } else {
+      // Double-probe inconclusive — try Abstract API as final tiebreaker
+      console.log(`[VerifEye] Edu catch-all double-probe inconclusive for ${email} — trying Abstract API`);
+      const apiResult = await verifyViaAbstractAPI(email);
+      if (apiResult.valid === true) {
+        smtp = { verdict: "accepted", message: "Abstract API confirmed deliverable (edu catch-all)", catchAll: false };
+        base.details.smtp = true;
+        base.details.catchAll = false;
+        base.details.smtpVerdict = "api_confirmed_valid";
+        base.flags = base.flags.filter(f => f !== "catch_all");
+        base.flags.push("api_verified");
+      } else if (apiResult.valid === false) {
+        smtp = { verdict: "invalid_mailbox", message: apiResult.reason, catchAll: false };
+        base.details.smtp = false;
+        base.details.catchAll = false;
+        base.details.smtpVerdict = "api_confirmed_invalid";
+        base.flags = base.flags.filter(f => f !== "catch_all");
+        base.flags.push("api_rejected");
+      }
+      // null → Abstract API also inconclusive, keep smtp as catch_all → stays Risky
     }
-    // inconclusive → keep smtp as catch_all and proceed to normal scoring
   }
 
   // ─── Layer 6: Confidence scoring + status classification ────────────────
@@ -1302,6 +1322,33 @@ app.post("/api/verify/deep", rateLimit, requireAuth, async (req: AuthRequest, re
           ? `Yahoo could not be verified automatically: ${webResult.reason}`
           : "Add ABSTRACT_API_KEY to .env to enable reliable Yahoo verification. Yahoo blocks verification emails from third-party SMTP servers.",
       });
+    }
+
+    // ── Educational domains: try Abstract API first (before SMTP sending) ──────
+    // Edu catch-all servers are common — Abstract API can give a definitive
+    // answer cheaply instead of relying on a bounce from the SMTP send.
+    if (isEducationalDomain(domain)) {
+      const apiResult = await verifyViaAbstractAPI(normalizedEmail);
+      if (apiResult.valid !== null) {
+        const db = await getDb();
+        const newStatus = apiResult.valid ? "Valid" : "Invalid";
+        const newScore = apiResult.valid ? 80 : 0;
+        if (numericLogId) {
+          await db.run(
+            "UPDATE logs SET status = ?, confidence_score = ? WHERE id = ?",
+            [newStatus, newScore, numericLogId]
+          );
+        }
+        return res.json({
+          success: true,
+          immediate: true,
+          method: "abstract_api",
+          status: newStatus,
+          message: `[Educational domain] ${apiResult.reason}`,
+        });
+      }
+      // Abstract API inconclusive — fall through to SMTP email sending
+      console.log(`[VerifEye] Abstract API inconclusive for edu domain ${domain} — falling through to SMTP send`);
     }
 
     // ── Non-Yahoo: standard SMTP email send (works for MS/iCloud/ProtonMail) ──
