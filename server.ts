@@ -669,13 +669,15 @@ async function verifyYahooViaWebProbe(email: string): Promise<{ valid: boolean |
 //   email_deliverability.status        : "deliverable" | "undeliverable" | "unknown"
 //   email_deliverability.is_mx_valid   : boolean
 //   email_quality.score                : number | null   (0.0 – 1.0)
+//   email_quality.is_catchall          : boolean | null  ← if true, server accepts ALL addresses
+//                                        including fake ones — "deliverable" is meaningless here
 //
 // When status === "unknown" (Yahoo blocks their SMTP probes too), quality_score is used
 // as a soft tiebreaker:
 //   >= 0.80 + MX valid  → treat as deliverable
 //   > 0 and <= 0.30     → treat as undeliverable
 //   0.00 / null         → "unable to score" (rate limit / missing field) → inconclusive
-async function verifyViaAbstractAPI(email: string): Promise<{ valid: boolean | null; reason: string; qualityScore?: number }> {
+async function verifyViaAbstractAPI(email: string): Promise<{ valid: boolean | null; reason: string; qualityScore?: number; isCatchAll?: boolean }> {
   const key = process.env.ABSTRACT_API_KEY;
   if (!key) return { valid: null, reason: "No ABSTRACT_API_KEY configured" };
   try {
@@ -690,11 +692,24 @@ async function verifyViaAbstractAPI(email: string): Promise<{ valid: boolean | n
     const status: string = (data.email_deliverability?.status ?? "").toLowerCase();
     const qs: number = parseFloat(data.email_quality?.score ?? "0") || 0;
     const mxValid: boolean = data.email_deliverability?.is_mx_valid === true;
+    // is_catchall: true means the server accepts ALL RCPT TO including fake addresses.
+    // "deliverable" on a catch-all domain does NOT confirm the specific mailbox exists.
+    const isCatchAll: boolean = data.email_quality?.is_catchall === true;
 
-    console.log(`[VerifEye] Abstract API → email=${email} status=${status} score=${qs} mxValid=${mxValid}`);
+    console.log(`[VerifEye] Abstract API → email=${email} status=${status} score=${qs} mxValid=${mxValid} catchAll=${isCatchAll}`);
 
     if (status === "deliverable") {
-      return { valid: true, reason: `Deliverable (Abstract API, quality score: ${qs.toFixed(2)})`, qualityScore: qs };
+      if (isCatchAll) {
+        // Catch-all server — accepts all addresses including fake ones.
+        // Return inconclusive so callers fall through to catch-all / Risky handling.
+        return {
+          valid: null,
+          reason: `Catch-all mail exchanger — server accepts all addresses including fake ones. Mailbox existence cannot be confirmed (Abstract API, quality score: ${qs.toFixed(2)}).`,
+          qualityScore: qs,
+          isCatchAll: true,
+        };
+      }
+      return { valid: true, reason: `Deliverable (Abstract API, quality score: ${qs.toFixed(2)})`, qualityScore: qs, isCatchAll: false };
     }
     if (status === "undeliverable") {
       const detail = data.email_deliverability?.status_detail ?? "undeliverable";
@@ -703,11 +718,12 @@ async function verifyViaAbstractAPI(email: string): Promise<{ valid: boolean | n
 
     // status === "unknown" — provider (Yahoo/iCloud) blocks Abstract API's SMTP probes too.
     // Fall back to quality_score as a soft signal.
-    if (qs >= 0.80 && mxValid) {
+    if (qs >= 0.80 && mxValid && !isCatchAll) {
       return {
         valid: true,
         reason: `Likely deliverable — valid format and MX, SMTP unverifiable by API (quality score: ${qs.toFixed(2)})`,
         qualityScore: qs,
+        isCatchAll: false,
       };
     }
     if (qs > 0 && qs <= 0.30) {
