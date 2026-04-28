@@ -694,13 +694,14 @@ async function verifyViaAbstractAPI(email: string): Promise<{ valid: boolean | n
         qualityScore: qs,
       };
     }
-    if (qs <= 0.30) {
+    if (qs > 0 && qs <= 0.30) {
       return {
         valid: false,
         reason: `Likely undeliverable — very low quality score: ${qs.toFixed(2)}`,
         qualityScore: qs,
       };
     }
+    // qs === 0.00 means "unable to score" (API rate limit / missing field) — treat as inconclusive
 
     // Genuinely inconclusive
     return { valid: null, reason: `Abstract API: deliverability unknown (quality score: ${qs.toFixed(2)})`, qualityScore: qs };
