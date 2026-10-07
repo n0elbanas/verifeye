@@ -118,7 +118,6 @@ const DETECTED_PROVIDER_LABEL: Record<string, string> = {
 // Flag display config
 const FLAG_CONFIG: Record<string, { label: string; color: string }> = {
   disposable:      { label: "Disposable",    color: "bg-red-100 text-red-700 border-red-200" },
-  role_based:      { label: "Role Address",  color: "bg-orange-100 text-orange-700 border-orange-200" },
   catch_all:       { label: "Catch-All",     color: "bg-amber-100 text-amber-700 border-amber-200" },
   free_provider:   { label: "Free Provider", color: "bg-blue-100 text-blue-700 border-blue-200" },
   possible_typo:   { label: "Possible Typo", color: "bg-purple-100 text-purple-700 border-purple-200" },

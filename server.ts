@@ -1,13 +1,10 @@
 import "dotenv/config";
-import express, { Request, Response, NextFunction } from "express";
+import express, { Request, Response } from "express";
 import { createServer as createViteServer } from "vite";
 import dns from "dns";
 import { promisify } from "util";
 import validator from "validator";
 import net from "net";
-import cookieParser from "cookie-parser";
-import jwt from "jsonwebtoken";
-import bcrypt from "bcryptjs";
 import { getDb } from "./db.js";
 import { startRetryQueue, enqueueRetry, getPendingJobs, registerSmtpProbe } from "./src/queue/retryQueue.js";
 import {
@@ -16,8 +13,6 @@ import {
   getDeepVerificationStatus,
   markPixelDelivered,
 } from "./src/mailer/verificationMailer.js";
-
-const JWT_SECRET = process.env.JWT_SECRET || "supersecret_verifeye123!";
 
 const resolveMx = promisify(dns.resolveMx);
 const resolveA = promisify(dns.resolve4);
@@ -28,54 +23,8 @@ const MAX_BULK = 1000;
 const BATCH_SIZE = 20;
 
 app.use(express.json({ limit: "2mb" }));
-app.use(cookieParser());
 
 getDb().catch(console.error);
-
-// ---------------------------------------------------------------------------
-// Auth middleware
-// ---------------------------------------------------------------------------
-interface AuthRequest extends Request {
-  user?: any;
-}
-
-const requireAuth = (req: AuthRequest, res: Response, next: NextFunction) => {
-  const token = req.cookies.token;
-  if (!token) return res.status(401).json({ error: "Unauthorized" });
-  try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    req.user = decoded;
-    next();
-  } catch {
-    return res.status(401).json({ error: "Invalid token" });
-  }
-};
-
-const requireAdmin = (req: AuthRequest, res: Response, next: NextFunction) => {
-  if (req.user?.role !== "ADMIN") return res.status(403).json({ error: "Forbidden" });
-  next();
-};
-
-// ---------------------------------------------------------------------------
-// Daily-limit helper
-// ---------------------------------------------------------------------------
-async function checkAndLogLimit(db: any, userId: number, count: number): Promise<boolean> {
-  const user = await db.get("SELECT * FROM users WHERE id = ?", [userId]);
-  if (!user) return false;
-
-  const today = new Date().toISOString().split("T")[0];
-  if (user.last_check_date !== today) {
-    await db.run("UPDATE users SET emails_checked_today = 0, last_check_date = ? WHERE id = ?", [today, userId]);
-    user.emails_checked_today = 0;
-  }
-
-  if (user.daily_limit !== -1 && (user.emails_checked_today + count) > user.daily_limit) {
-    return false;
-  }
-
-  await db.run("UPDATE users SET emails_checked_today = emails_checked_today + ? WHERE id = ?", [count, userId]);
-  return true;
-}
 
 // ---------------------------------------------------------------------------
 // Rate limiting (100 req / min per IP)
@@ -167,21 +116,6 @@ const DISPOSABLE_DOMAINS = new Set([
   "spamfree24.org", "spam.la", "nowhere.org",
 ]);
 
-// ---------------------------------------------------------------------------
-// Role-based address prefixes
-// ---------------------------------------------------------------------------
-const ROLE_PREFIXES = new Set([
-  "admin", "administrator", "info", "information",
-  "support", "help", "helpdesk", "contact",
-  "noreply", "no-reply", "donotreply", "do-not-reply",
-  "postmaster", "webmaster", "hostmaster", "abuse",
-  "sales", "marketing", "billing", "accounts",
-  "hr", "jobs", "careers", "office",
-  "privacy", "legal", "security", "team",
-  "hello", "enquiries", "enquiry", "newsletter",
-  "news", "notifications", "mailer", "bounce",
-  "root", "daemon", "nobody", "www",
-]);
 
 // ---------------------------------------------------------------------------
 // Free-provider domains list
@@ -298,7 +232,6 @@ interface ScoreFactors {
   mxFound: boolean;
   smtpAccepted: boolean;
   catchAll: boolean;
-  roleBased: boolean;
   disposable: boolean;
   freeProvider: boolean;
   educationalDomain: boolean;
@@ -322,7 +255,6 @@ function calculateConfidenceScore(factors: ScoreFactors): number {
   // Negative signals
   if (factors.disposable) score -= 25;
   if (factors.catchAll) score -= 15;
-  if (factors.roleBased) score -= 10;
   if (factors.freeProvider) score -= 5;
   if (factors.typoDomain) score -= 20;
   if (factors.policyBlock) score -= 5; // slight penalty, but not decisive
@@ -801,17 +733,13 @@ async function verifySingleEmail(email: string): Promise<EmailVerificationResult
     } catch (_) {}
     base.confidenceScore = calculateConfidenceScore({
       syntaxValid: true, mxFound: base.details.dns,
-      smtpAccepted: false, catchAll: false, roleBased: false,
+      smtpAccepted: false, catchAll: false,
       disposable: true, freeProvider: false, educationalDomain: false,
       businessDomain: false, typoDomain: !!typoSuggestion,
       smtpBlocking: false, greylisted: false, policyBlock: false,
     });
     return base;
   }
-
-  // ─── Flag: Role-based prefix ────────────────────────────────────────────
-  const isRoleBased = ROLE_PREFIXES.has(prefix);
-  if (isRoleBased) base.flags.push("role_based");
 
   // ─── Layer 3: DNS / MX resolution ───────────────────────────────────────
   let mxRecords: dns.MxRecord[] = [];
@@ -861,9 +789,9 @@ async function verifySingleEmail(email: string): Promise<EmailVerificationResult
       const apiResult = await verifyViaAbstractAPI(email);
       if (apiResult.valid !== null) {
         if (apiResult.valid) {
-          const score = calculateConfidenceScore({ syntaxValid: true, mxFound: true, smtpAccepted: true, catchAll: false, roleBased: isRoleBased, disposable: false, freeProvider: true, educationalDomain: false, businessDomain: false, typoDomain: !!typoSuggestion, smtpBlocking: false, greylisted: false, policyBlock: false });
+          const score = calculateConfidenceScore({ syntaxValid: true, mxFound: true, smtpAccepted: true, catchAll: false, disposable: false, freeProvider: true, educationalDomain: false, businessDomain: false, typoDomain: !!typoSuggestion, smtpBlocking: false, greylisted: false, policyBlock: false });
           base.confidenceScore = score;
-          base.status = isRoleBased ? "Risky" : scoreToStatus(score);
+          base.status = scoreToStatus(score);
           base.details.smtpVerdict = "api_confirmed_valid";
           base.flags.push("api_verified");
           base.reason = `${apiResult.reason}. Confidence: ${score}/100.`;
@@ -880,9 +808,9 @@ async function verifySingleEmail(email: string): Promise<EmailVerificationResult
       // 2. Try Yahoo login-challenge web probe
       const webResult = await verifyYahooViaWebProbe(email);
       if (webResult.valid === true) {
-        const score = calculateConfidenceScore({ syntaxValid: true, mxFound: true, smtpAccepted: true, catchAll: false, roleBased: isRoleBased, disposable: false, freeProvider: true, educationalDomain: false, businessDomain: false, typoDomain: !!typoSuggestion, smtpBlocking: false, greylisted: false, policyBlock: false });
+        const score = calculateConfidenceScore({ syntaxValid: true, mxFound: true, smtpAccepted: true, catchAll: false, disposable: false, freeProvider: true, educationalDomain: false, businessDomain: false, typoDomain: !!typoSuggestion, smtpBlocking: false, greylisted: false, policyBlock: false });
         base.confidenceScore = score;
-        base.status = isRoleBased ? "Risky" : scoreToStatus(score);
+        base.status = scoreToStatus(score);
         base.details.smtpVerdict = "yahoo_web_probe_valid";
         base.flags.push("yahoo_web_confirmed");
         base.reason = `${webResult.reason}. Confidence: ${score}/100.`;
@@ -910,7 +838,6 @@ async function verifySingleEmail(email: string): Promise<EmailVerificationResult
           ? "Abstract API was inconclusive — Yahoo limits SMTP probing for all third-party services."
           : "Add ABSTRACT_API_KEY to .env to improve Yahoo verification accuracy.",
         `Confidence: ${score}/100.`,
-        isRoleBased ? `Role-based address (${prefix}@).` : "",
         typoSuggestion ? `Possible typo — did you mean "${typoSuggestion}"?` : "",
       ].filter(Boolean).join(" ");
       return base;
@@ -926,7 +853,6 @@ async function verifySingleEmail(email: string): Promise<EmailVerificationResult
     base.reason = [
       `${providerName} actively prevents external verification to protect user privacy.`,
       `Use Deep Verify for a definitive result. Confidence: ${score}/100.`,
-      isRoleBased ? `Role-based address (${prefix}@).` : "",
       typoSuggestion ? `Possible typo detected — did you mean "${typoSuggestion}"?` : "",
     ].filter(Boolean).join(" ");
     return base;
@@ -999,7 +925,6 @@ async function verifySingleEmail(email: string): Promise<EmailVerificationResult
     mxFound: true,
     smtpAccepted: smtp.verdict === "accepted" || smtp.verdict === "catch_all",
     catchAll: smtp.catchAll,
-    roleBased: isRoleBased,
     disposable: false,
     freeProvider: isFreeProvider,
     educationalDomain: isEducational,
@@ -1015,10 +940,8 @@ async function verifySingleEmail(email: string): Promise<EmailVerificationResult
 
   switch (smtp.verdict) {
     case "accepted":
-      base.status = isRoleBased ? "Risky" : scoreToStatus(score);
-      base.reason = isRoleBased
-        ? `Role-based address (${prefix}@) — mailbox accepted but may not reach a personal inbox. Confidence: ${score}/100.`
-        : `Syntax OK, MX records found, SMTP accepted the recipient. Confidence: ${score}/100.`;
+      base.status = scoreToStatus(score);
+      base.reason = `Syntax OK, MX records found, SMTP accepted the recipient. Confidence: ${score}/100.`;
       break;
 
     case "catch_all":
@@ -1122,133 +1045,47 @@ registerSmtpProbe(async (email: string) => {
 // API Routes
 // ---------------------------------------------------------------------------
 
-// ── Auth ────────────────────────────────────────────────────────────────────
-app.post("/api/auth/login", async (req: Request, res: Response) => {
-  const { email, password } = req.body;
-  if (!email || !password) return res.status(400).json({ error: "Missing email or password" });
+// ── System Status & Diagnostics ─────────────────────────────────────────────
+app.get("/api/system/status", async (_req: Request, res: Response) => {
   try {
     const db = await getDb();
-    const user = await db.get("SELECT * FROM users WHERE email = ?", [email]);
-    if (!user) return res.status(401).json({ error: "Invalid email or password" });
-    const valid = await bcrypt.compare(password, user.password_hash);
-    if (!valid) return res.status(401).json({ error: "Invalid email or password" });
-    const token = jwt.sign({ id: user.id, email: user.email, role: user.role, limit: user.daily_limit }, JWT_SECRET, { expiresIn: "1d" });
-    res.cookie("token", token, { httpOnly: true, sameSite: "strict" });
-    const { password_hash, ...safeUser } = user;
-    res.json({ user: safeUser });
+    const logCount = await db.get("SELECT COUNT(*) as count FROM logs");
+    const retryCount = await db.get("SELECT COUNT(*) as count FROM retry_queue WHERE resolved = 0");
+    res.json({
+      mailerEnabled: MAILER_ENABLED,
+      abstractApiConfigured: !!process.env.ABSTRACT_API_KEY,
+      totalLogs: logCount?.count ?? 0,
+      pendingRetries: retryCount?.count ?? 0,
+      timestamp: new Date().toISOString(),
+    });
   } catch {
     res.status(500).json({ error: "Server error" });
   }
-});
-
-app.post("/api/auth/logout", (_req, res) => {
-  res.clearCookie("token");
-  res.json({ success: true });
-});
-
-app.get("/api/auth/me", requireAuth, async (req: AuthRequest, res: Response) => {
-  try {
-    const db = await getDb();
-    const user = await db.get("SELECT * FROM users WHERE id = ?", [req.user.id]);
-    if (user) {
-      const { password_hash, ...safeUser } = user;
-      res.json({ user: safeUser });
-    } else {
-      res.status(404).json({ error: "User not found" });
-    }
-  } catch {
-    res.status(500).json({ error: "Server error" });
-  }
-});
-
-// ── Users ────────────────────────────────────────────────────────────────────
-app.get("/api/users", requireAuth, requireAdmin, async (_req, res) => {
-  try {
-    const db = await getDb();
-    const users = await db.all("SELECT id, email, role, daily_limit, emails_checked_today, last_check_date FROM users");
-    res.json(users);
-  } catch { res.status(500).json({ error: "Server error" }); }
-});
-
-app.post("/api/users", requireAuth, requireAdmin, async (req, res) => {
-  const { email, password, limit } = req.body;
-  if (!email || !password) return res.status(400).json({ error: "Missing required fields" });
-  try {
-    const db = await getDb();
-    const hash = await bcrypt.hash(password, 10);
-    const result = await db.run("INSERT INTO users (email, password_hash, role, daily_limit) VALUES (?, ?, 'USER', ?)", [email, hash, parseInt(limit) || -1]);
-    res.json({ success: true, id: result.lastID });
-  } catch (e: any) {
-    res.status(400).json({ error: e.message });
-  }
-});
-
-app.put("/api/users/:id/limit", requireAuth, requireAdmin, async (req, res) => {
-  const { daily_limit } = req.body;
-  try {
-    const db = await getDb();
-    await db.run("UPDATE users SET daily_limit = ? WHERE id = ?", [parseInt(daily_limit), req.params.id]);
-    res.json({ success: true });
-  } catch { res.status(500).json({ error: "Server error" }); }
-});
-
-app.delete("/api/users/:id", requireAuth, requireAdmin, async (req: AuthRequest, res) => {
-  try {
-    const db = await getDb();
-    await db.run("DELETE FROM logs WHERE user_id = ?", [req.params.id]);
-    await db.run("DELETE FROM users WHERE id = ?", [req.params.id]);
-    res.json({ success: true });
-  } catch { res.status(500).json({ error: "Server error" }); }
-});
-
-app.put("/api/users/:id/password", requireAuth, requireAdmin, async (req: AuthRequest, res) => {
-  const { newPassword } = req.body;
-  if (!newPassword) return res.status(400).json({ error: "Missing password field" });
-  try {
-    const db = await getDb();
-    const hash = await bcrypt.hash(newPassword, 10);
-    await db.run("UPDATE users SET password_hash = ? WHERE id = ?", [hash, req.params.id]);
-    res.json({ success: true });
-  } catch { res.status(500).json({ error: "Server error" }); }
-});
-
-app.put("/api/users/password", requireAuth, async (req: AuthRequest, res) => {
-  const { currentPassword, newPassword } = req.body;
-  if (!currentPassword || !newPassword) return res.status(400).json({ error: "Missing fields" });
-  try {
-    const db = await getDb();
-    const user = await db.get("SELECT * FROM users WHERE id = ?", [req.user.id]);
-    const valid = await bcrypt.compare(currentPassword, user.password_hash);
-    if (!valid) return res.status(400).json({ error: "Incorrect current password" });
-    const hash = await bcrypt.hash(newPassword, 10);
-    await db.run("UPDATE users SET password_hash = ? WHERE id = ?", [hash, req.user.id]);
-    res.json({ success: true });
-  } catch { res.status(500).json({ error: "Server error" }); }
 });
 
 // ── Logs ─────────────────────────────────────────────────────────────────────
-app.get("/api/logs", requireAuth, async (req: AuthRequest, res) => {
+app.get("/api/logs", async (_req: Request, res: Response) => {
   try {
     const db = await getDb();
-    let logs;
-    if (req.user.role === "ADMIN") {
-      logs = await db.all(`
-        SELECT logs.id, logs.email, logs.status, logs.confidence_score, logs.flags, logs.timestamp,
-               users.email as checked_by
-        FROM logs
-        JOIN users ON logs.user_id = users.id
-        ORDER BY timestamp DESC LIMIT 500
-      `);
-    } else {
-      logs = await db.all(`
-        SELECT id, email, status, confidence_score, flags, timestamp
-        FROM logs
-        WHERE user_id = ?
-        ORDER BY timestamp DESC LIMIT 500
-      `, [req.user.id]);
-    }
+    const logs = await db.all(`
+      SELECT id, email, status, confidence_score, flags, timestamp
+      FROM logs
+      ORDER BY timestamp DESC LIMIT 500
+    `);
     res.json(logs);
-  } catch { res.status(500).json({ error: "Server error" }); }
+  } catch {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.delete("/api/logs", async (_req: Request, res: Response) => {
+  try {
+    const db = await getDb();
+    await db.run("DELETE FROM logs");
+    res.json({ success: true });
+  } catch {
+    res.status(500).json({ error: "Server error" });
+  }
 });
 
 // ── Verification ──────────────────────────────────────────────────────────────
@@ -1261,7 +1098,6 @@ app.get("/api/logs", requireAuth, async (req: AuthRequest, res) => {
  */
 async function safeLogInsert(
   db: any,
-  userId: number,
   email: string,
   status: string,
   confidenceScore: number,
@@ -1270,7 +1106,7 @@ async function safeLogInsert(
   try {
     return await db.run(
       "INSERT INTO logs (user_id, email, status, confidence_score, flags) VALUES (?, ?, ?, ?, ?)",
-      [userId, email, status, confidenceScore, JSON.stringify(flags)]
+      [1, email, status, confidenceScore, JSON.stringify(flags)]
     );
   } catch (err: any) {
     // Column missing — production DB not yet migrated; degrade gracefully
@@ -1278,30 +1114,27 @@ async function safeLogInsert(
       console.warn("[VerifEye] logs table missing new columns — falling back to base insert. Restart the server to apply the self-healing migration.");
       return db.run(
         "INSERT INTO logs (user_id, email, status) VALUES (?, ?, ?)",
-        [userId, email, status]
+        [1, email, status]
       );
     }
     throw err;
   }
 }
 
-app.post("/api/verify", rateLimit, requireAuth, async (req: AuthRequest, res: Response) => {
+app.post("/api/verify", rateLimit, async (req: Request, res: Response) => {
   try {
     const { email } = req.body;
     if (!email || typeof email !== "string") return res.status(400).json({ error: "email field is required" });
 
     const db = await getDb();
-    const canCheck = await checkAndLogLimit(db, req.user.id, 1);
-    if (!canCheck) return res.status(403).json({ error: "Daily verification limit reached." });
-
     const result = await verifySingleEmail(email.trim());
 
     const logResult = await safeLogInsert(
-      db, req.user.id, result.email, result.status, result.confidenceScore, result.flags
+      db, result.email, result.status, result.confidenceScore, result.flags
     );
 
     if (result.details.smtpVerdict === "greylisted") {
-      await enqueueRetry(result.email, req.user.id);
+      await enqueueRetry(result.email, 1);
     }
 
     return res.json({ ...result, logId: logResult.lastID });
@@ -1311,7 +1144,7 @@ app.post("/api/verify", rateLimit, requireAuth, async (req: AuthRequest, res: Re
   }
 });
 
-app.post("/api/verify-bulk", rateLimit, requireAuth, async (req: AuthRequest, res: Response) => {
+app.post("/api/verify-bulk", rateLimit, async (req: Request, res: Response) => {
   try {
     const { emails } = req.body;
     if (!Array.isArray(emails)) return res.status(400).json({ error: "emails must be an array" });
@@ -1320,15 +1153,12 @@ app.post("/api/verify-bulk", rateLimit, requireAuth, async (req: AuthRequest, re
     if (trimmed.length === 0) return res.json({ results: [], total: 0 });
 
     const db = await getDb();
-    const canCheck = await checkAndLogLimit(db, req.user.id, trimmed.length);
-    if (!canCheck) return res.status(403).json({ error: `Daily limit exceeded. Cannot process ${trimmed.length} emails.` });
-
     const results = await verifyBatch(trimmed);
 
     for (const r of results) {
-      await safeLogInsert(db, req.user.id, r.email, r.status, r.confidenceScore, r.flags);
+      await safeLogInsert(db, r.email, r.status, r.confidenceScore, r.flags);
       if (r.details.smtpVerdict === "greylisted") {
-        await enqueueRetry(r.email, req.user.id);
+        await enqueueRetry(r.email, 1);
       }
     }
 
@@ -1347,7 +1177,7 @@ const YAHOO_FAMILY_DOMAINS = new Set([
   "ymail.com", "rocketmail.com", "aol.com",
 ]);
 
-app.post("/api/verify/deep", rateLimit, requireAuth, async (req: AuthRequest, res: Response) => {
+app.post("/api/verify/deep", rateLimit, async (req: Request, res: Response) => {
   try {
     const { email, logId } = req.body;
     if (!email || typeof email !== "string") return res.status(400).json({ error: "email is required" });
@@ -1450,7 +1280,7 @@ app.post("/api/verify/deep", rateLimit, requireAuth, async (req: AuthRequest, re
   }
 });
 
-app.get("/api/verify/deep/:id", requireAuth, async (req: AuthRequest, res: Response) => {
+app.get("/api/verify/deep/:id", async (req: Request, res: Response) => {
   try {
     const status = await getDeepVerificationStatus(parseInt(req.params.id));
     if (!status) return res.status(404).json({ error: "Not found" });
@@ -1482,11 +1312,21 @@ app.get("/r/:token", async (req, res) => {
   res.end(PIXEL_GIF);
 });
 
-// ── Admin: retry queue status ─────────────────────────────────────────────────
-app.get("/api/retry-queue", requireAuth, requireAdmin, async (_req, res) => {
+// ── Retry queue status & management ───────────────────────────────────────────
+app.get("/api/retry-queue", async (_req: Request, res: Response) => {
   try {
     const jobs = await getPendingJobs();
     res.json(jobs);
+  } catch {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.delete("/api/retry-queue", async (_req: Request, res: Response) => {
+  try {
+    const db = await getDb();
+    await db.run("DELETE FROM retry_queue");
+    res.json({ success: true });
   } catch {
     res.status(500).json({ error: "Server error" });
   }

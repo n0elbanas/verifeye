@@ -1,16 +1,9 @@
 import React from 'react';
-import { Outlet, Link, useNavigate } from 'react-router-dom';
-import { ShieldCheck, Settings, FileText, LogOut } from 'lucide-react';
-import { useAuth } from '../contexts/AuthContext';
+import { Outlet, Link, useLocation } from 'react-router-dom';
+import { ShieldCheck, Settings, FileText, CheckCircle2 } from 'lucide-react';
 
 export default function Layout() {
-  const { user, logout } = useAuth();
-  const navigate = useNavigate();
-
-  const handleLogout = () => {
-    logout();
-    navigate('/login');
-  };
+  const location = useLocation();
 
   return (
     <div className="min-h-screen bg-[#F7F7F5] text-[#1A1A1A] font-sans selection:bg-emerald-100 flex flex-col">
@@ -24,33 +17,40 @@ export default function Layout() {
             <span className="font-semibold text-xl tracking-tight">VerifEye</span>
           </Link>
           
-          {user && (
-            <div className="flex items-center gap-4">
-              <div className="hidden sm:block text-xs text-zinc-500">
-                <span>
-                  {user.email} <span className="uppercase text-[9px] bg-zinc-100 px-1.5 py-0.5 rounded font-mono ml-1">{user.role}</span>
-                </span>
-              </div>
-              <div className="flex items-center gap-1 bg-emerald-50 text-emerald-700 border border-emerald-100 px-2 sm:px-2.5 py-1 rounded-full font-mono text-[10px]" title="Daily Verification Limit">
-                <span className="font-medium">
-                  {user.emails_checked_today ?? 0}
-                </span>
-                <span className="opacity-50">/</span>
-                <span className="font-medium">
-                  {user.daily_limit === -1 ? '∞' : user.daily_limit}
-                </span>
-              </div>
-              <Link to="/logs" className="p-2 text-zinc-400 hover:text-emerald-600 transition-colors" title="Audit Logs">
-                <FileText className="w-5 h-5" />
-              </Link>
-              <Link to="/settings" className="p-2 text-zinc-400 hover:text-emerald-600 transition-colors" title="Settings">
-                <Settings className="w-5 h-5" />
-              </Link>
-              <button onClick={handleLogout} className="p-2 text-zinc-400 hover:text-red-500 transition-colors" title="Log Out">
-                <LogOut className="w-5 h-5" />
-              </button>
-            </div>
-          )}
+          <div className="flex items-center gap-2 sm:gap-3">
+            <Link
+              to="/"
+              className={`px-3 py-1.5 text-xs font-medium rounded-xl transition-colors flex items-center gap-1.5 ${
+                location.pathname === '/'
+                  ? 'bg-emerald-50 text-emerald-700 border border-emerald-200/60 font-semibold'
+                  : 'text-zinc-600 hover:text-emerald-600 hover:bg-zinc-50'
+              }`}
+            >
+              <CheckCircle2 className="w-4 h-4" />
+              <span>Verifier</span>
+            </Link>
+            <Link
+              to="/logs"
+              className={`px-3 py-1.5 text-xs font-medium rounded-xl transition-colors flex items-center gap-1.5 ${
+                location.pathname === '/logs'
+                  ? 'bg-emerald-50 text-emerald-700 border border-emerald-200/60 font-semibold'
+                  : 'text-zinc-600 hover:text-emerald-600 hover:bg-zinc-50'
+              }`}
+              title="Audit Logs"
+            >
+              <FileText className="w-4 h-4" />
+              <span>Audit Logs</span>
+            </Link>
+            <Link
+              to="/settings"
+              className={`p-2 text-zinc-500 hover:text-emerald-600 hover:bg-zinc-50 rounded-xl transition-colors ${
+                location.pathname === '/settings' ? 'bg-zinc-100 text-emerald-600' : ''
+              }`}
+              title="Settings & Diagnostics"
+            >
+              <Settings className="w-4 h-4" />
+            </Link>
+          </div>
         </div>
       </header>
 

@@ -12,7 +12,7 @@ VerifEye is a fast, accurate MVP web application designed to validate whether em
   - **SMTP Handshake**: Simulated SMTP conversations (without sending real mail) via port 25 and 587.
 - **Verifalia-style SMTP Parsing**: Intelligently handles major provider anti-harvesting blocks (like Microsoft and Yahoo returning `5.7.x` or `5.1.1` to probes) so valid emails aren't falsely flagged as invalid.
 - **Provider Intelligence**: Autodetects domains as Free, Business, Educational, or Disposable based on MX fingerprints.
-- **Risk Assessment**: Flags role-based addresses (`admin@`, `support@`) and catch-all domains as `Risky`.
+- **Risk Assessment**: Flags catch-all domains and disposable providers as `Risky`.
 - **Export**: Download full bulk verification results to CSV.
 
 ## Classification System
@@ -20,7 +20,7 @@ VerifEye is a fast, accurate MVP web application designed to validate whether em
 Emails are classified into one of four statuses:
 1. **Valid**: Syntax is healthy, DNS/MX exists, and SMTP server positively confirmed the mailbox.
 2. **Invalid**: Syntax is bad, domain is dead, or the provider explicitly confirmed the inbox does not exist.
-3. **Risky**: Mailbox *might* exist, but it requires caution (e.g., disposable provider, role-based alias, or catch-all server).
+3. **Risky**: Mailbox *might* exist, but it requires caution (e.g., disposable provider or catch-all server).
 4. **Unknown**: The server temporarily deferred or policy-blocked the verification probe (common with free providers like Hotmail).
 
 ## Setup & Local Development

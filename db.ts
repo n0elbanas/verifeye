@@ -1,6 +1,5 @@
 import sqlite3 from "sqlite3";
 import { open, Database } from "sqlite";
-import bcrypt from "bcryptjs";
 
 let dbInstance: Database | null = null;
 
@@ -88,15 +87,12 @@ export async function getDb(): Promise<Database> {
   await addColumnIfMissing(db, "logs", "confidence_score", "INTEGER DEFAULT NULL");
   await addColumnIfMissing(db, "logs", "flags", "TEXT DEFAULT NULL");
 
-  // ── Default admin ────────────────────────────────────────────────────────
-  const admin = await db.get("SELECT id FROM users WHERE email = 'admin@verifeye.ph'");
-  if (!admin) {
-    const defaultPasswordHash = await bcrypt.hash("asdQWE123#", 10);
+  // ── Default system user (for foreign key compatibility) ──────────────────
+  const defaultUser = await db.get("SELECT id FROM users WHERE id = 1");
+  if (!defaultUser) {
     await db.run(
-      `INSERT INTO users (email, password_hash, role, daily_limit) VALUES (?, ?, ?, ?)`,
-      ["admin@verifeye.ph", defaultPasswordHash, "ADMIN", -1]
+      `INSERT INTO users (id, email, password_hash, role, daily_limit) VALUES (1, 'system@verifeye.local', '', 'USER', -1)`
     );
-    console.log("[VerifEye] Default admin user created: admin@verifeye.ph");
   }
 
   dbInstance = db;
